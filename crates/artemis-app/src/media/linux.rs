@@ -8,10 +8,6 @@ use gstreamer_app as gst_app;
 
 use artemis_moonlight::{AudioEventReceiver, StreamEvent};
 
-// Keep several Moonlight packets queued ahead of the device clock so brief receive or scheduling
-// jitter cannot starve PipeWire and make the hardware repeat its last samples.
-const AUDIO_PREROLL_MS: u64 = 100;
-
 pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
@@ -307,9 +303,7 @@ impl AudioTimeline {
     }
 
     fn next(&mut self, start: gst::ClockTime) -> (gst::ClockTime, gst::ClockTime) {
-        let pts = self.next_pts.unwrap_or_else(|| {
-            start.saturating_add(gst::ClockTime::from_mseconds(AUDIO_PREROLL_MS))
-        });
+        let pts = self.next_pts.unwrap_or(start);
         self.next_pts = Some(pts.saturating_add(self.frame_duration));
         (pts, self.frame_duration)
     }
@@ -331,18 +325,19 @@ impl AudioPipeline {
             ));
         }
         let timeline = AudioTimeline::new(sample_rate, samples_per_frame)?;
-        // The dedicated audio worker feeds packets at Moonlight's playback cadence. Use native
-        // PipeWire so PulseAudio compatibility buffering cannot inflate the playback quantum and
-        // replay stale device data during an underrun.
+        // Match Moonlight's working PipeWire-Pulse path on the reference host: float samples,
+        // a 3.75 ms write quantum, and a 15 ms device buffer. The auto sink's defaults inflated
+        // the negotiated quantum to 90 ms on the same host.
         let description = format!(
             "appsrc name=audio_src is-live=true format=time do-timestamp=false \
              caps=audio/x-opus,rate={sample_rate},channels={channels},\
              channel-mapping-family=0 ! opusparse ! \
              opusdec plc=true use-inband-fec=true ! audioconvert ! \
              audioresample ! \
-             audio/x-raw,format=S16LE,rate={sample_rate},channels={channels} ! \
+             audio/x-raw,format=F32LE,rate={sample_rate},channels={channels} ! \
              tee name=audio_tee \
-             audio_tee. ! queue ! pipewiresink sync=true"
+             audio_tee. ! queue ! \
+             pulsesink sync=true buffer-time=15000 latency-time=3750"
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
@@ -447,7 +442,7 @@ mod tests {
     use gstreamer as gst;
 
     #[test]
-    fn opus_timeline_prerolls_and_preserves_five_millisecond_cadence() {
+    fn opus_timeline_preserves_five_millisecond_cadence_for_batched_packets() {
         let mut timeline = AudioTimeline::new(48_000, 240).expect("valid Opus timing");
         let start = gst::ClockTime::from_mseconds(500);
 
@@ -456,10 +451,10 @@ mod tests {
         assert_eq!(
             timestamps,
             [
-                gst::ClockTime::from_mseconds(600),
-                gst::ClockTime::from_mseconds(605),
-                gst::ClockTime::from_mseconds(610),
-                gst::ClockTime::from_mseconds(615),
+                gst::ClockTime::from_mseconds(500),
+                gst::ClockTime::from_mseconds(505),
+                gst::ClockTime::from_mseconds(510),
+                gst::ClockTime::from_mseconds(515),
             ]
         );
     }

@@ -21,6 +21,7 @@ pub fn print_report() {
         "opusparse",
         "opusdec",
         "pipewiresink",
+        "pulsesink",
     ] {
         report_plugin(plugin);
     }
