@@ -24,6 +24,7 @@ pub fn print_report() {
         "pulsesink",
         "vah264dec",
         "vapostproc",
+        "videorate",
     ] {
         report_plugin(plugin);
     }

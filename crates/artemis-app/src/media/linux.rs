@@ -185,9 +185,9 @@ impl Drop for VideoPipeline {
 
 fn video_decoder_chain(hardware_available: bool) -> &'static str {
     if hardware_available {
-        "vah264dec ! vapostproc"
+        "vah264dec ! videorate drop-only=true max-rate=30 ! vapostproc"
     } else {
-        "avdec_h264 ! videoconvert"
+        "avdec_h264 ! videorate drop-only=true max-rate=30 ! videoconvert"
     }
 }
 
@@ -536,7 +536,13 @@ mod tests {
 
     #[test]
     fn video_decoder_prefers_va_api_when_available() {
-        assert_eq!(video_decoder_chain(true), "vah264dec ! vapostproc");
-        assert_eq!(video_decoder_chain(false), "avdec_h264 ! videoconvert");
+        assert_eq!(
+            video_decoder_chain(true),
+            "vah264dec ! videorate drop-only=true max-rate=30 ! vapostproc"
+        );
+        assert_eq!(
+            video_decoder_chain(false),
+            "avdec_h264 ! videorate drop-only=true max-rate=30 ! videoconvert"
+        );
     }
 }
