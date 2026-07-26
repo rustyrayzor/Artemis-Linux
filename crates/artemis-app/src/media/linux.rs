@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -274,6 +276,7 @@ struct AudioPipeline {
     pipeline: gst::Pipeline,
     source: gst_app::AppSrc,
     timeline: AudioTimeline,
+    encoded_diagnostic: Option<BufWriter<File>>,
 }
 
 struct AudioTimeline {
@@ -352,14 +355,31 @@ impl AudioPipeline {
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|error| error.to_string())?;
+        let encoded_diagnostic = open_encoded_audio_diagnostic(
+            sample_rate,
+            channels,
+            streams,
+            coupled_streams,
+            samples_per_frame,
+            mapping,
+        )?;
         Ok(Self {
             pipeline,
             source,
             timeline,
+            encoded_diagnostic,
         })
     }
 
     fn push(&mut self, packet: Vec<u8>) -> Result<(), String> {
+        if let Some(diagnostic) = &mut self.encoded_diagnostic {
+            let length = u32::try_from(packet.len())
+                .map_err(|_| "encoded Opus diagnostic packet is too large".to_owned())?;
+            diagnostic
+                .write_all(&length.to_le_bytes())
+                .and_then(|()| diagnostic.write_all(&packet))
+                .map_err(|error| format!("failed to write encoded Opus diagnostic: {error}"))?;
+        }
         let start = self
             .pipeline
             .current_running_time()
@@ -381,6 +401,40 @@ impl AudioPipeline {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+}
+
+fn open_encoded_audio_diagnostic(
+    sample_rate: i32,
+    channels: i32,
+    streams: i32,
+    coupled_streams: i32,
+    samples_per_frame: i32,
+    mapping: &[u8],
+) -> Result<Option<BufWriter<File>>, String> {
+    let Ok(location) = std::env::var("ARTEMIS_AUDIO_DIAGNOSTIC_OPUS") else {
+        return Ok(None);
+    };
+    if location.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let file = File::create(&location)
+        .map_err(|error| format!("failed to create encoded Opus diagnostic: {error}"))?;
+    let mut writer = BufWriter::new(file);
+    let mapping_length = u32::try_from(mapping.len())
+        .map_err(|_| "Opus diagnostic channel mapping is too large".to_owned())?;
+    writer
+        .write_all(b"AML_OPUS")
+        .and_then(|()| writer.write_all(&1_u32.to_le_bytes()))
+        .and_then(|()| writer.write_all(&sample_rate.to_le_bytes()))
+        .and_then(|()| writer.write_all(&channels.to_le_bytes()))
+        .and_then(|()| writer.write_all(&streams.to_le_bytes()))
+        .and_then(|()| writer.write_all(&coupled_streams.to_le_bytes()))
+        .and_then(|()| writer.write_all(&samples_per_frame.to_le_bytes()))
+        .and_then(|()| writer.write_all(&mapping_length.to_le_bytes()))
+        .and_then(|()| writer.write_all(mapping))
+        .map_err(|error| format!("failed to initialize encoded Opus diagnostic: {error}"))?;
+    Ok(Some(writer))
 }
 
 fn attach_audio_diagnostic(pipeline: &gst::Pipeline) -> Result<(), String> {
@@ -415,6 +469,9 @@ impl Drop for AudioPipeline {
     fn drop(&mut self) {
         let _ = self.source.end_of_stream();
         let _ = self.pipeline.set_state(gst::State::Null);
+        if let Some(diagnostic) = &mut self.encoded_diagnostic {
+            let _ = diagnostic.flush();
+        }
     }
 }
 
