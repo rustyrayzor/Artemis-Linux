@@ -13,6 +13,7 @@ use crate::{Error, Result};
 
 const CERT_FILE: &str = "client.crt";
 const KEY_FILE: &str = "client.key";
+const PROJECT_APPLICATION: &str = "Artemis-Linux";
 const UNIQUE_ID_FILE: &str = "uniqueid";
 
 /// Long-lived client identity used for pairing and mutual TLS.
@@ -31,13 +32,14 @@ impl ClientIdentity {
     ///
     /// Returns an error if the platform directory, identity files, or cryptography fail.
     pub fn load_or_create_default() -> Result<Self> {
-        let directories = directories::ProjectDirs::from("com", "Rayzor Studios", "Artemis Linux")
-            .ok_or_else(|| {
-                Error::Configuration(
-                    "the operating system did not provide a user configuration directory"
-                        .to_owned(),
-                )
-            })?;
+        let directories =
+            directories::ProjectDirs::from("com", "Rayzor Studios", PROJECT_APPLICATION)
+                .ok_or_else(|| {
+                    Error::Configuration(
+                        "the operating system did not provide a user configuration directory"
+                            .to_owned(),
+                    )
+                })?;
         Self::load_or_create(directories.config_dir())
     }
 
@@ -169,4 +171,21 @@ fn secure_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::PROJECT_APPLICATION;
+
+    #[test]
+    fn project_directory_matches_documented_linux_slug() {
+        let directories =
+            directories::ProjectDirs::from("com", "Rayzor Studios", PROJECT_APPLICATION)
+                .expect("Linux should provide a home directory");
+
+        assert_eq!(
+            directories.project_path(),
+            std::path::Path::new("artemis-linux")
+        );
+    }
 }
