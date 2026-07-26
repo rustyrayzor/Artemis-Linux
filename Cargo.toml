@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "crates/artemis-app",
+    "crates/artemis-core",
+    "crates/artemis-moonlight",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+repository = "https://github.com/rustyrayzor/Artemis-Linux"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+crossbeam-channel = "0.5.15"
+directories = "6.0.0"
+eframe = { version = "0.31.1", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+gilrs = "0.11.0"
+gstreamer = "0.24.2"
+gstreamer-app = "0.24.2"
+hex = "0.4.3"
+mdns-sd = "0.13.11"
+openssl = "0.10.75"
+quick-xml = "0.37.5"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+url = "2.5.7"
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

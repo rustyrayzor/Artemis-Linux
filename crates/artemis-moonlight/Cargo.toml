@@ -1,0 +1,19 @@
+[package]
+name = "artemis-moonlight"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+links = "artemis_moonlight_shim"
+
+[dependencies]
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+cmake = "0.1.54"
+
+[lints]
+workspace = true
