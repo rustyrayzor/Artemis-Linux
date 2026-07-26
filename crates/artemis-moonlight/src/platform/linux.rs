@@ -111,6 +111,9 @@ unsafe impl Send for Session {}
 
 #[allow(clippy::missing_errors_doc)]
 impl Session {
+    // Ownership ensures the per-session input key is zeroized immediately after the native
+    // shim copies it, whether connection setup succeeds or fails.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn connect(config: StreamConfig) -> Result<(Self, EventReceiver)> {
         if ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
