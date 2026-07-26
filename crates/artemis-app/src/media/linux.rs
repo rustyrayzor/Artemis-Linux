@@ -352,20 +352,7 @@ impl AudioPipeline {
             ));
         }
         let timeline = AudioTimeline::new(sample_rate, samples_per_frame)?;
-        // Match Moonlight's working PipeWire-Pulse path on the reference host: float samples,
-        // a 3.75 ms write quantum, and a 15 ms device buffer. The auto sink's defaults inflated
-        // the negotiated quantum to 90 ms on the same host.
-        let description = format!(
-            "appsrc name=audio_src is-live=true format=time do-timestamp=false \
-             caps=audio/x-opus,rate={sample_rate},channels={channels},\
-             channel-mapping-family=0 ! opusparse ! \
-             opusdec plc=true use-inband-fec=true ! audioconvert ! \
-             audioresample ! \
-             audio/x-raw,format=F32LE,rate={sample_rate},channels={channels} ! \
-             tee name=audio_tee \
-             audio_tee. ! queue ! \
-             pulsesink sync=true buffer-time=15000 latency-time=3750"
-        );
+        let description = audio_pipeline_description(sample_rate, channels, audio_sink_sync());
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
             .downcast::<gst::Pipeline>()
@@ -425,6 +412,32 @@ impl AudioPipeline {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+}
+
+fn audio_sink_sync() -> bool {
+    matches!(
+        std::env::var("ARTEMIS_AUDIO_SINK_SYNC").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
+}
+
+fn audio_pipeline_description(sample_rate: i32, channels: i32, sink_sync: bool) -> String {
+    // Match Moonlight's working PipeWire-Pulse path on the reference host: float samples,
+    // a 3.75 ms write quantum, and a 15 ms device buffer. Pulse owns playback pacing just as
+    // SDL's queued-audio backend does; synchronizing a second GStreamer clock can turn small
+    // network scheduling corrections into audible repeats. The environment override is retained
+    // for beta diagnostics and controlled comparisons.
+    format!(
+        "appsrc name=audio_src is-live=true format=time do-timestamp=false \
+         caps=audio/x-opus,rate={sample_rate},channels={channels},\
+         channel-mapping-family=0 ! opusparse ! \
+         opusdec plc=true use-inband-fec=true ! audioconvert ! \
+         audioresample ! \
+         audio/x-raw,format=F32LE,rate={sample_rate},channels={channels} ! \
+         tee name=audio_tee \
+         audio_tee. ! queue ! \
+         pulsesink sync={sink_sync} buffer-time=15000 latency-time=3750"
+    )
 }
 
 fn open_encoded_audio_diagnostic(
@@ -519,7 +532,9 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioTimeline, presentation_size, video_decoder_chain};
+    use super::{
+        AudioTimeline, audio_pipeline_description, presentation_size, video_decoder_chain,
+    };
     use gstreamer as gst;
 
     #[test]
@@ -544,6 +559,14 @@ mod tests {
     fn opus_timeline_rejects_invalid_configuration() {
         assert!(AudioTimeline::new(0, 240).is_err());
         assert!(AudioTimeline::new(48_000, 0).is_err());
+    }
+
+    #[test]
+    fn pulse_owns_audio_pacing_by_default() {
+        let description = audio_pipeline_description(48_000, 2, false);
+
+        assert!(description.contains("audio/x-raw,format=F32LE,rate=48000,channels=2"));
+        assert!(description.contains("pulsesink sync=false buffer-time=15000 latency-time=3750"));
     }
 
     #[test]
