@@ -145,10 +145,13 @@ fn button_flag(button: Button) -> Option<i32> {
     })
 }
 
+// These casts intentionally quantize a clamped normalized axis to Moonlight's wire format.
+#[allow(clippy::cast_possible_truncation)]
 fn stick(value: f32) -> i16 {
     (value.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn trigger(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * f32::from(u8::MAX)).round() as u8
 }

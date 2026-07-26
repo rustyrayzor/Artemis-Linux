@@ -38,7 +38,7 @@ impl MediaRuntime {
                 height,
                 fps,
             } => {
-                if format & 0x000f == 0 {
+                if format.trailing_zeros() >= 4 {
                     return Err(format!(
                         "host selected unsupported video format 0x{format:x}"
                     ));
