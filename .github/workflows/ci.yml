@@ -46,7 +46,10 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/artemis-linux dist/
-          sha256sum dist/artemis-linux > dist/artemis-linux.sha256
+          (
+            cd dist
+            sha256sum artemis-linux > artemis-linux.sha256
+          )
           tar -C dist -czf artemis-linux-x86_64-ubuntu-24.04.tar.gz \
             artemis-linux artemis-linux.sha256
 
