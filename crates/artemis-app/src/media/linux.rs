@@ -260,12 +260,16 @@ impl AudioPipeline {
              caps=audio/x-opus,rate={sample_rate},channels={channels},\
              channel-mapping-family=0 ! opusparse ! \
              opusdec plc=true use-inband-fec=true ! audioconvert ! \
-             audioresample ! autoaudiosink sync=true"
+             audioresample ! \
+             audio/x-raw,format=S16LE,rate={sample_rate},channels={channels} ! \
+             tee name=audio_tee \
+             audio_tee. ! queue ! autoaudiosink sync=true"
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
             .downcast::<gst::Pipeline>()
             .map_err(|_| "GStreamer did not construct an audio pipeline".to_owned())?;
+        attach_audio_diagnostic(&pipeline)?;
         let source = pipeline
             .by_name("audio_src")
             .ok_or_else(|| "audio appsrc is missing".to_owned())?
@@ -303,6 +307,34 @@ impl AudioPipeline {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+}
+
+fn attach_audio_diagnostic(pipeline: &gst::Pipeline) -> Result<(), String> {
+    let Ok(location) = std::env::var("ARTEMIS_AUDIO_DIAGNOSTIC_PCM") else {
+        return Ok(());
+    };
+    if location.trim().is_empty() {
+        return Ok(());
+    }
+
+    let tee = pipeline
+        .by_name("audio_tee")
+        .ok_or_else(|| "audio diagnostic tee is missing".to_owned())?;
+    let queue = gst::ElementFactory::make("queue")
+        .name("audio_diagnostic_queue")
+        .build()
+        .map_err(|error| error.to_string())?;
+    let sink = gst::ElementFactory::make("filesink")
+        .name("audio_diagnostic_sink")
+        .property("location", &location)
+        .property("sync", false)
+        .property("async", false)
+        .build()
+        .map_err(|error| error.to_string())?;
+    pipeline
+        .add_many([&queue, &sink])
+        .map_err(|error| error.to_string())?;
+    gst::Element::link_many([&tee, &queue, &sink]).map_err(|error| error.to_string())
 }
 
 impl Drop for AudioPipeline {
