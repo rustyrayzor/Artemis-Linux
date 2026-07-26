@@ -1,6 +1,6 @@
 //! Safe Rust ownership boundary around the process-global moonlight-common-c API.
 
-use crossbeam_channel::{Receiver, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError, unbounded};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 mod platform;
@@ -83,7 +83,20 @@ pub struct EventReceiver {
     pub(crate) video: Receiver<StreamEvent>,
 }
 
+/// Receives lossless audio events on a dedicated playback thread.
+pub struct AudioEventReceiver {
+    receiver: Receiver<StreamEvent>,
+}
+
 impl EventReceiver {
+    /// Detaches audio delivery from the lifecycle and video event pump.
+    pub fn take_audio(&mut self) -> AudioEventReceiver {
+        let (_sender, replacement) = unbounded();
+        AudioEventReceiver {
+            receiver: std::mem::replace(&mut self.audio, replacement),
+        }
+    }
+
     /// Returns the next lifecycle or media event without blocking.
     ///
     /// # Errors
@@ -101,8 +114,25 @@ impl EventReceiver {
     }
 }
 
+impl AudioEventReceiver {
+    /// Waits up to `timeout` for the next audio event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Timeout` when no event arrives before the deadline and `Disconnected` after the
+    /// native callback sender has been dropped.
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<StreamEvent, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crossbeam_channel::{bounded, unbounded};
 
     use super::{EventReceiver, StreamEvent};
@@ -136,6 +166,39 @@ mod tests {
         assert!(matches!(
             receiver.try_recv(),
             Ok(StreamEvent::VideoFrame { bytes, .. }) if bytes == [1]
+        ));
+    }
+
+    #[test]
+    fn detached_audio_is_not_pumped_with_video() {
+        let (_control_sender, control) = unbounded();
+        let (audio_sender, audio) = unbounded();
+        let (video_sender, video) = bounded(1);
+        let mut receiver = EventReceiver {
+            control,
+            audio,
+            video,
+        };
+        let audio_receiver = receiver.take_audio();
+
+        audio_sender
+            .send(StreamEvent::AudioPacket(vec![2]))
+            .expect("audio receiver should remain connected");
+        video_sender
+            .send(StreamEvent::VideoFrame {
+                bytes: vec![1],
+                key_frame: true,
+                presentation_time_us: 0,
+            })
+            .expect("video receiver should remain connected");
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(StreamEvent::VideoFrame { bytes, .. }) if bytes == [1]
+        ));
+        assert!(matches!(
+            audio_receiver.recv_timeout(Duration::from_millis(10)),
+            Ok(StreamEvent::AudioPacket(packet)) if packet == [2]
         ));
     }
 }

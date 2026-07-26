@@ -359,30 +359,34 @@ impl ArtemisApp {
                 } => {
                     self.busy = false;
                     match result {
-                        Ok((mut session, events)) => match MediaRuntime::new() {
-                            Ok(media) => {
-                                self.status = format!("Stream connected: {title}");
-                                self.active_stream = Some(ActiveStream {
-                                    session,
-                                    events,
-                                    media,
-                                    controller: ControllerManager::new(),
-                                    input: InputRouter::new(),
-                                    record,
-                                    app_title: title,
-                                    connected: false,
-                                });
-                                context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-                                    egui::CursorGrab::Locked,
-                                ));
-                                context
-                                    .send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+                        Ok((mut session, mut events)) => {
+                            let audio_events = events.take_audio();
+                            match MediaRuntime::new(audio_events) {
+                                Ok(media) => {
+                                    self.status = format!("Stream connected: {title}");
+                                    self.active_stream = Some(ActiveStream {
+                                        session,
+                                        events,
+                                        media,
+                                        controller: ControllerManager::new(),
+                                        input: InputRouter::new(),
+                                        record,
+                                        app_title: title,
+                                        connected: false,
+                                    });
+                                    context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                                        egui::CursorGrab::Locked,
+                                    ));
+                                    context.send_viewport_cmd(
+                                        egui::ViewportCommand::CursorVisible(false),
+                                    );
+                                }
+                                Err(error) => {
+                                    session.stop();
+                                    self.status = error;
+                                }
                             }
-                            Err(error) => {
-                                session.stop();
-                                self.status = error;
-                            }
-                        },
+                        }
                         Err(error) => self.status = error,
                     }
                 }

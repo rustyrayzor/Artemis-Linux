@@ -1,9 +1,12 @@
-use crossbeam_channel::{Receiver, bounded};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use artemis_moonlight::StreamEvent;
+use artemis_moonlight::{AudioEventReceiver, StreamEvent};
 
 pub struct DecodedFrame {
     pub width: usize,
@@ -13,18 +16,18 @@ pub struct DecodedFrame {
 
 pub struct MediaRuntime {
     video: Option<VideoPipeline>,
-    audio: Option<AudioPipeline>,
+    audio: AudioWorker,
     frames: Receiver<DecodedFrame>,
     frame_sender: crossbeam_channel::Sender<DecodedFrame>,
 }
 
 impl MediaRuntime {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(audio_events: AudioEventReceiver) -> Result<Self, String> {
         gst::init().map_err(|error| error.to_string())?;
         let (frame_sender, frames) = bounded(2);
         Ok(Self {
             video: None,
-            audio: None,
+            audio: AudioWorker::spawn(audio_events)?,
             frames,
             frame_sender,
         })
@@ -59,28 +62,7 @@ impl MediaRuntime {
                     video.push(bytes, key_frame, presentation_time_us)?;
                 }
             }
-            StreamEvent::AudioSetup {
-                sample_rate,
-                channels,
-                streams,
-                coupled_streams,
-                samples_per_frame,
-                mapping,
-            } => {
-                self.audio = Some(AudioPipeline::new(
-                    sample_rate,
-                    channels,
-                    streams,
-                    coupled_streams,
-                    samples_per_frame,
-                    &mapping,
-                )?);
-            }
-            StreamEvent::AudioPacket(packet) => {
-                if let Some(audio) = &mut self.audio {
-                    audio.push(packet)?;
-                }
-            }
+            StreamEvent::AudioSetup { .. } | StreamEvent::AudioPacket(_) => {}
             _ => {}
         }
         Ok(())
@@ -98,16 +80,12 @@ impl MediaRuntime {
         self.video
             .as_ref()
             .and_then(|video| pipeline_error(&video.pipeline))
-            .or_else(|| {
-                self.audio
-                    .as_ref()
-                    .and_then(|audio| pipeline_error(&audio.pipeline))
-            })
+            .or_else(|| self.audio.poll_error())
     }
 
     pub fn shutdown(&mut self) {
         self.video.take();
-        self.audio.take();
+        self.audio.shutdown();
     }
 }
 
@@ -197,6 +175,99 @@ impl Drop for VideoPipeline {
     fn drop(&mut self) {
         let _ = self.source.end_of_stream();
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+struct AudioWorker {
+    stop: Sender<()>,
+    errors: Receiver<String>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl AudioWorker {
+    fn spawn(events: AudioEventReceiver) -> Result<Self, String> {
+        let (stop, stop_receiver) = bounded(1);
+        let (error_sender, errors) = unbounded();
+        let thread = thread::Builder::new()
+            .name("artemis-audio".to_owned())
+            .spawn(move || run_audio_worker(&events, &stop_receiver, &error_sender))
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            stop,
+            errors,
+            thread: Some(thread),
+        })
+    }
+
+    fn poll_error(&self) -> Option<String> {
+        self.errors.try_recv().ok()
+    }
+
+    fn shutdown(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let _ = self.stop.try_send(());
+        let _ = thread.join();
+    }
+}
+
+impl Drop for AudioWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_audio_worker(events: &AudioEventReceiver, stop: &Receiver<()>, errors: &Sender<String>) {
+    let mut audio = None;
+    loop {
+        if stop.try_recv().is_ok() {
+            break;
+        }
+        match events.recv_timeout(Duration::from_millis(10)) {
+            Ok(StreamEvent::AudioSetup {
+                sample_rate,
+                channels,
+                streams,
+                coupled_streams,
+                samples_per_frame,
+                mapping,
+            }) => {
+                match AudioPipeline::new(
+                    sample_rate,
+                    channels,
+                    streams,
+                    coupled_streams,
+                    samples_per_frame,
+                    &mapping,
+                ) {
+                    Ok(pipeline) => audio = Some(pipeline),
+                    Err(error) => {
+                        audio = None;
+                        let _ = errors.send(error);
+                    }
+                }
+            }
+            Ok(StreamEvent::AudioPacket(packet)) => {
+                let Some(pipeline) = &mut audio else {
+                    continue;
+                };
+                if let Err(error) = pipeline.push(packet) {
+                    audio = None;
+                    let _ = errors.send(error);
+                }
+            }
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if let Some(error) = audio
+            .as_ref()
+            .and_then(|pipeline| pipeline_error(&pipeline.pipeline))
+        {
+            audio = None;
+            let _ = errors.send(error);
+        }
     }
 }
 

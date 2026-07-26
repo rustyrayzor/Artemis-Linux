@@ -442,7 +442,7 @@ extern "C" fn on_audio_setup(
         // valid for this callback. The bytes are copied before returning.
         let mapping = unsafe { slice::from_raw_parts(mapping, mapping_length) }.to_vec();
         context
-            .control
+            .audio
             .send(StreamEvent::AudioSetup {
                 sample_rate,
                 channels,

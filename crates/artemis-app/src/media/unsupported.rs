@@ -1,4 +1,4 @@
-use artemis_moonlight::StreamEvent;
+use artemis_moonlight::{AudioEventReceiver, StreamEvent};
 
 pub struct DecodedFrame {
     pub width: usize,
@@ -10,7 +10,7 @@ pub struct MediaRuntime;
 
 #[allow(clippy::unused_self)]
 impl MediaRuntime {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(_audio_events: AudioEventReceiver) -> Result<Self, String> {
         Err("streaming media is supported only on Linux".to_owned())
     }
 
