@@ -260,7 +260,7 @@ impl AudioPipeline {
              caps=audio/x-opus,rate={sample_rate},channels={channels},\
              channel-mapping-family=0 ! opusparse ! \
              opusdec plc=true use-inband-fec=true ! audioconvert ! \
-             audioresample ! pipewiresink sync=true"
+             audioresample ! autoaudiosink sync=true"
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
