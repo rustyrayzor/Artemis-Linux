@@ -62,7 +62,6 @@ impl MediaRuntime {
                     video.push(bytes, key_frame, presentation_time_us)?;
                 }
             }
-            StreamEvent::AudioSetup { .. } | StreamEvent::AudioPacket(_) => {}
             _ => {}
         }
         Ok(())
