@@ -1,3 +1,8 @@
+//! Audited Linux FFI implementation.
+//!
+//! Unsafe code is confined to this module and each operation documents its safety invariant.
+#![allow(unsafe_code)]
+
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
@@ -113,7 +118,7 @@ impl Session {
         {
             return Err(Error::AlreadyActive);
         }
-        match Self::connect_inner(config) {
+        match Self::connect_inner(&config) {
             Ok(value) => Ok(value),
             Err(error) => {
                 ACTIVE.store(false, Ordering::Release);
@@ -122,7 +127,7 @@ impl Session {
         }
     }
 
-    fn connect_inner(config: StreamConfig) -> Result<(Self, EventReceiver)> {
+    fn connect_inner(config: &StreamConfig) -> Result<(Self, EventReceiver)> {
         let address = CString::new(config.address.as_str()).map_err(|_| Error::InvalidString)?;
         let app_version =
             CString::new(config.app_version.as_str()).map_err(|_| Error::InvalidString)?;
