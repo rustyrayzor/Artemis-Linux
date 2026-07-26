@@ -22,6 +22,8 @@ pub fn print_report() {
         "opusdec",
         "pipewiresink",
         "pulsesink",
+        "vah264dec",
+        "vapostproc",
     ] {
         report_plugin(plugin);
     }

@@ -102,16 +102,20 @@ impl VideoPipeline {
         _fps: i32,
         frames: crossbeam_channel::Sender<DecodedFrame>,
     ) -> Result<Self, String> {
-        let pipeline = gst::parse::launch(
+        let has_va_decoder = gst::ElementFactory::find("vah264dec").is_some()
+            && gst::ElementFactory::find("vapostproc").is_some();
+        let decoder_chain = video_decoder_chain(has_va_decoder);
+        let description = format!(
             "appsrc name=video_src is-live=true format=time do-timestamp=false \
              caps=video/x-h264,stream-format=byte-stream,alignment=au ! \
-             h264parse config-interval=-1 ! avdec_h264 ! videoconvert ! \
+             h264parse config-interval=-1 ! {decoder_chain} ! \
              video/x-raw,format=RGBA ! \
-             appsink name=video_sink max-buffers=2 drop=true sync=false",
-        )
-        .map_err(|error| error.to_string())?
-        .downcast::<gst::Pipeline>()
-        .map_err(|_| "GStreamer did not construct a video pipeline".to_owned())?;
+             appsink name=video_sink max-buffers=2 drop=true sync=false"
+        );
+        let pipeline = gst::parse::launch(&description)
+            .map_err(|error| error.to_string())?
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| "GStreamer did not construct a video pipeline".to_owned())?;
         let source = pipeline
             .by_name("video_src")
             .ok_or_else(|| "video appsrc is missing".to_owned())?
@@ -176,6 +180,14 @@ impl Drop for VideoPipeline {
     fn drop(&mut self) {
         let _ = self.source.end_of_stream();
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+fn video_decoder_chain(hardware_available: bool) -> &'static str {
+    if hardware_available {
+        "vah264dec ! vapostproc"
+    } else {
+        "avdec_h264 ! videoconvert"
     }
 }
 
@@ -495,7 +507,7 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::AudioTimeline;
+    use super::{AudioTimeline, video_decoder_chain};
     use gstreamer as gst;
 
     #[test]
@@ -520,5 +532,11 @@ mod tests {
     fn opus_timeline_rejects_invalid_configuration() {
         assert!(AudioTimeline::new(0, 240).is_err());
         assert!(AudioTimeline::new(48_000, 0).is_err());
+    }
+
+    #[test]
+    fn video_decoder_prefers_va_api_when_available() {
+        assert_eq!(video_decoder_chain(true), "vah264dec ! vapostproc");
+        assert_eq!(video_decoder_chain(false), "avdec_h264 ! videoconvert");
     }
 }
