@@ -94,7 +94,8 @@ unsafe extern "C" {
 
 struct CallbackContext {
     control: Sender<StreamEvent>,
-    media: Sender<StreamEvent>,
+    audio: Sender<StreamEvent>,
+    video: Sender<StreamEvent>,
 }
 
 /// Sole owner of a process-global moonlight-common-c connection.
@@ -168,10 +169,12 @@ impl Session {
         };
 
         let (control_sender, control_receiver) = unbounded();
-        let (media_sender, media_receiver) = bounded(128);
+        let (audio_sender, audio_receiver) = unbounded();
+        let (video_sender, video_receiver) = bounded(128);
         let callback_context = Box::new(CallbackContext {
             control: control_sender,
-            media: media_sender,
+            audio: audio_sender,
+            video: video_sender,
         });
         let callback_context =
             NonNull::new(Box::into_raw(callback_context)).ok_or(Error::Allocation)?;
@@ -216,7 +219,8 @@ impl Session {
             },
             EventReceiver {
                 control: control_receiver,
-                media: media_receiver,
+                audio: audio_receiver,
+                video: video_receiver,
             },
         ))
     }
@@ -408,7 +412,7 @@ extern "C" fn on_video_frame(
         // SAFETY: The C shim guarantees this buffer is valid for exactly this callback. It is
         // copied into owned Rust memory before returning.
         let bytes = unsafe { slice::from_raw_parts(data, length) }.to_vec();
-        let _ = context.media.try_send(StreamEvent::VideoFrame {
+        let _ = context.video.try_send(StreamEvent::VideoFrame {
             bytes,
             key_frame: frame_type == 1,
             presentation_time_us,
@@ -457,12 +461,16 @@ extern "C" fn on_audio_packet(userdata: *mut c_void, data: *const u8, length: us
         let Some(context) = callback_context(userdata) else {
             return;
         };
-        if data.is_null() || length == 0 {
-            return;
-        }
-        // SAFETY: The C shim guarantees this borrowed packet is valid for the callback. It is
-        // copied into owned Rust memory before returning.
-        let packet = unsafe { slice::from_raw_parts(data, length) }.to_vec();
-        let _ = context.media.try_send(StreamEvent::AudioPacket(packet));
+        let packet = if length == 0 {
+            Vec::new()
+        } else {
+            if data.is_null() {
+                return;
+            }
+            // SAFETY: The C shim guarantees this borrowed packet is valid for the callback. It is
+            // copied into owned Rust memory before returning.
+            unsafe { slice::from_raw_parts(data, length) }.to_vec()
+        };
+        let _ = context.audio.send(StreamEvent::AudioPacket(packet));
     }));
 }

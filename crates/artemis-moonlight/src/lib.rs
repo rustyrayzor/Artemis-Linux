@@ -72,13 +72,15 @@ pub enum StreamEvent {
         samples_per_frame: i32,
         mapping: Vec<u8>,
     },
+    /// One encoded Opus frame. An empty frame requests packet-loss concealment.
     AudioPacket(Vec<u8>),
 }
 
-/// Receives priority lifecycle events before bounded media events.
+/// Receives priority lifecycle events, lossless audio events, then droppable video events.
 pub struct EventReceiver {
     pub(crate) control: Receiver<StreamEvent>,
-    pub(crate) media: Receiver<StreamEvent>,
+    pub(crate) audio: Receiver<StreamEvent>,
+    pub(crate) video: Receiver<StreamEvent>,
 }
 
 impl EventReceiver {
@@ -91,8 +93,54 @@ impl EventReceiver {
     pub fn try_recv(&self) -> std::result::Result<StreamEvent, TryRecvError> {
         match self.control.try_recv() {
             Ok(event) => Ok(event),
-            Err(TryRecvError::Disconnected | TryRecvError::Empty) => self.media.try_recv(),
+            Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
+                match self.audio.try_recv() {
+                    Ok(event) => Ok(event),
+                    Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
+                        self.video.try_recv()
+                    }
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossbeam_channel::{bounded, unbounded};
+
+    use super::{EventReceiver, StreamEvent};
+
+    #[test]
+    fn audio_is_received_before_droppable_video() {
+        let (_control_sender, control) = unbounded();
+        let (audio_sender, audio) = unbounded();
+        let (video_sender, video) = bounded(1);
+        let receiver = EventReceiver {
+            control,
+            audio,
+            video,
+        };
+
+        video_sender
+            .send(StreamEvent::VideoFrame {
+                bytes: vec![1],
+                key_frame: true,
+                presentation_time_us: 0,
+            })
+            .expect("video receiver should remain connected");
+        audio_sender
+            .send(StreamEvent::AudioPacket(vec![2]))
+            .expect("audio receiver should remain connected");
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(StreamEvent::AudioPacket(packet)) if packet == [2]
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(StreamEvent::VideoFrame { bytes, .. }) if bytes == [1]
+        ));
     }
 }
 

@@ -62,12 +62,22 @@ impl MediaRuntime {
             StreamEvent::AudioSetup {
                 sample_rate,
                 channels,
-                ..
+                streams,
+                coupled_streams,
+                samples_per_frame,
+                mapping,
             } => {
-                self.audio = Some(AudioPipeline::new(sample_rate, channels)?);
+                self.audio = Some(AudioPipeline::new(
+                    sample_rate,
+                    channels,
+                    streams,
+                    coupled_streams,
+                    samples_per_frame,
+                    &mapping,
+                )?);
             }
             StreamEvent::AudioPacket(packet) => {
-                if let Some(audio) = &self.audio {
+                if let Some(audio) = &mut self.audio {
                     audio.push(packet)?;
                 }
             }
@@ -193,15 +203,64 @@ impl Drop for VideoPipeline {
 struct AudioPipeline {
     pipeline: gst::Pipeline,
     source: gst_app::AppSrc,
+    timeline: AudioTimeline,
+}
+
+struct AudioTimeline {
+    frame_duration: gst::ClockTime,
+    next_pts: Option<gst::ClockTime>,
+}
+
+impl AudioTimeline {
+    fn new(sample_rate: i32, samples_per_frame: i32) -> Result<Self, String> {
+        let sample_rate = u64::try_from(sample_rate)
+            .ok()
+            .filter(|rate| *rate > 0)
+            .ok_or_else(|| "host supplied an invalid Opus sample rate".to_owned())?;
+        let samples_per_frame = u64::try_from(samples_per_frame)
+            .ok()
+            .filter(|samples| *samples > 0)
+            .ok_or_else(|| "host supplied an invalid Opus frame size".to_owned())?;
+        let duration_ns = samples_per_frame
+            .checked_mul(gst::ClockTime::SECOND.nseconds())
+            .and_then(|nanoseconds| nanoseconds.checked_div(sample_rate))
+            .filter(|nanoseconds| *nanoseconds > 0)
+            .ok_or_else(|| "host supplied an invalid Opus frame duration".to_owned())?;
+        Ok(Self {
+            frame_duration: gst::ClockTime::from_nseconds(duration_ns),
+            next_pts: None,
+        })
+    }
+
+    fn next(&mut self, start: gst::ClockTime) -> (gst::ClockTime, gst::ClockTime) {
+        let pts = self.next_pts.unwrap_or(start);
+        self.next_pts = Some(pts.saturating_add(self.frame_duration));
+        (pts, self.frame_duration)
+    }
 }
 
 impl AudioPipeline {
-    fn new(sample_rate: i32, channels: i32) -> Result<Self, String> {
+    fn new(
+        sample_rate: i32,
+        channels: i32,
+        streams: i32,
+        coupled_streams: i32,
+        samples_per_frame: i32,
+        mapping: &[u8],
+    ) -> Result<Self, String> {
+        if channels != 2 || streams != 1 || coupled_streams != 1 || mapping != [0, 1] {
+            return Err(format!(
+                "host selected unsupported Opus layout: {channels} channels, \
+                 {streams} streams, {coupled_streams} coupled streams, mapping {mapping:?}"
+            ));
+        }
+        let timeline = AudioTimeline::new(sample_rate, samples_per_frame)?;
         let description = format!(
-            "appsrc name=audio_src is-live=true format=time do-timestamp=true \
+            "appsrc name=audio_src is-live=true format=time do-timestamp=false \
              caps=audio/x-opus,rate={sample_rate},channels={channels},\
-             channel-mapping-family=0 ! opusparse ! opusdec ! audioconvert ! \
-             audioresample ! autoaudiosink sync=false"
+             channel-mapping-family=0 ! opusparse ! \
+             opusdec plc=true use-inband-fec=true ! audioconvert ! \
+             audioresample ! pipewiresink sync=true"
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
@@ -215,12 +274,35 @@ impl AudioPipeline {
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|error| error.to_string())?;
-        Ok(Self { pipeline, source })
+        Ok(Self {
+            pipeline,
+            source,
+            timeline,
+        })
     }
 
-    fn push(&self, packet: Vec<u8>) -> Result<(), String> {
+    fn push(&mut self, packet: Vec<u8>) -> Result<(), String> {
+        let start = self
+            .pipeline
+            .current_running_time()
+            .unwrap_or(gst::ClockTime::ZERO);
+        let (pts, duration) = self.timeline.next(start);
+        if packet.is_empty() {
+            if self
+                .source
+                .send_event(gst::event::Gap::new(pts, duration))
+            {
+                return Ok(());
+            }
+            return Err("GStreamer rejected an Opus packet-loss gap".to_owned());
+        }
+        let mut buffer = gst::Buffer::from_mut_slice(packet);
+        if let Some(buffer) = buffer.get_mut() {
+            buffer.set_pts(pts);
+            buffer.set_duration(duration);
+        }
         self.source
-            .push_buffer(gst::Buffer::from_mut_slice(packet))
+            .push_buffer(buffer)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
@@ -249,4 +331,36 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AudioTimeline;
+    use gstreamer as gst;
+
+    #[test]
+    fn opus_timeline_preserves_five_millisecond_cadence_for_batched_packets() {
+        let mut timeline = AudioTimeline::new(48_000, 240).expect("valid Opus timing");
+        let start = gst::ClockTime::from_mseconds(500);
+
+        let timestamps = (0..4)
+            .map(|_| timeline.next(start).0)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            timestamps,
+            [
+                gst::ClockTime::from_mseconds(500),
+                gst::ClockTime::from_mseconds(505),
+                gst::ClockTime::from_mseconds(510),
+                gst::ClockTime::from_mseconds(515),
+            ]
+        );
+    }
+
+    #[test]
+    fn opus_timeline_rejects_invalid_configuration() {
+        assert!(AudioTimeline::new(0, 240).is_err());
+        assert!(AudioTimeline::new(48_000, 0).is_err());
+    }
 }

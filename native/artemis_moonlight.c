@@ -169,8 +169,7 @@ static int audio_setup(
 
 static void audio_packet(char* data, int length) {
     AmlSession* session = active_session();
-    if (session != NULL && data != NULL && length > 0 &&
-        session->callbacks.audio_packet != NULL) {
+    if (session != NULL && length >= 0 && session->callbacks.audio_packet != NULL) {
         session->callbacks.audio_packet(
             session->callbacks.userdata,
             (const uint8_t*)data,
