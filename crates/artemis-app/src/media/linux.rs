@@ -255,6 +255,9 @@ impl AudioPipeline {
             ));
         }
         let timeline = AudioTimeline::new(sample_rate, samples_per_frame)?;
+        // Moonlight delivers audio at playback cadence, while video uses a separate pipeline.
+        // Let the device pace playback so UI-thread packet batches are not discarded as late
+        // against an unrelated audio pipeline clock.
         let description = format!(
             "appsrc name=audio_src is-live=true format=time do-timestamp=false \
              caps=audio/x-opus,rate={sample_rate},channels={channels},\
@@ -263,7 +266,7 @@ impl AudioPipeline {
              audioresample ! \
              audio/x-raw,format=S16LE,rate={sample_rate},channels={channels} ! \
              tee name=audio_tee \
-             audio_tee. ! queue ! autoaudiosink sync=true"
+             audio_tee. ! queue ! autoaudiosink sync=false"
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
