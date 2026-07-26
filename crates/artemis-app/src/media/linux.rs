@@ -239,9 +239,10 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
         if let gst::MessageView::Error(error) = message.view() {
             return Some(format!(
                 "{}: {} ({:?})",
-                error
-                    .src()
-                    .map_or_else(|| "GStreamer".to_owned(), |source| source.path_string()),
+                error.src().map_or_else(
+                    || "GStreamer".to_owned(),
+                    |source| source.path_string().to_string()
+                ),
                 error.error(),
                 error.debug()
             ));
