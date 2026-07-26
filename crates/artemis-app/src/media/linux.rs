@@ -97,19 +97,20 @@ struct VideoPipeline {
 
 impl VideoPipeline {
     fn new(
-        _width: i32,
-        _height: i32,
+        width: i32,
+        height: i32,
         _fps: i32,
         frames: crossbeam_channel::Sender<DecodedFrame>,
     ) -> Result<Self, String> {
         let has_va_decoder = gst::ElementFactory::find("vah264dec").is_some()
             && gst::ElementFactory::find("vapostproc").is_some();
         let decoder_chain = video_decoder_chain(has_va_decoder);
+        let (presentation_width, presentation_height) = presentation_size(width, height);
         let description = format!(
             "appsrc name=video_src is-live=true format=time do-timestamp=false \
              caps=video/x-h264,stream-format=byte-stream,alignment=au ! \
              h264parse config-interval=-1 ! {decoder_chain} ! \
-             video/x-raw,format=RGBA ! \
+             video/x-raw,format=RGBA,width={presentation_width},height={presentation_height} ! \
              appsink name=video_sink max-buffers=2 drop=true sync=false"
         );
         let pipeline = gst::parse::launch(&description)
@@ -187,8 +188,19 @@ fn video_decoder_chain(hardware_available: bool) -> &'static str {
     if hardware_available {
         "vah264dec ! videorate drop-only=true max-rate=30 ! vapostproc"
     } else {
-        "avdec_h264 ! videorate drop-only=true max-rate=30 ! videoconvert"
+        "avdec_h264 ! videorate drop-only=true max-rate=30 ! videoconvert ! videoscale"
     }
+}
+
+fn presentation_size(width: i32, height: i32) -> (i32, i32) {
+    const MAX_PRESENTATION_WIDTH: i32 = 1280;
+
+    if width <= MAX_PRESENTATION_WIDTH || width <= 0 || height <= 0 {
+        return (width, height);
+    }
+    let scaled_height = i64::from(height) * i64::from(MAX_PRESENTATION_WIDTH) / i64::from(width);
+    let scaled_height = i32::try_from(scaled_height).unwrap_or(height).max(2) & !1;
+    (MAX_PRESENTATION_WIDTH, scaled_height)
 }
 
 struct AudioWorker {
@@ -507,7 +519,7 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioTimeline, video_decoder_chain};
+    use super::{AudioTimeline, presentation_size, video_decoder_chain};
     use gstreamer as gst;
 
     #[test]
@@ -542,7 +554,14 @@ mod tests {
         );
         assert_eq!(
             video_decoder_chain(false),
-            "avdec_h264 ! videorate drop-only=true max-rate=30 ! videoconvert"
+            "avdec_h264 ! videorate drop-only=true max-rate=30 ! videoconvert ! videoscale"
         );
+    }
+
+    #[test]
+    fn presentation_is_scaled_to_the_reference_window_before_readback() {
+        assert_eq!(presentation_size(1920, 1080), (1280, 720));
+        assert_eq!(presentation_size(1280, 720), (1280, 720));
+        assert_eq!(presentation_size(800, 600), (800, 600));
     }
 }

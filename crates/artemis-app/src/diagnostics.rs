@@ -25,6 +25,7 @@ pub fn print_report() {
         "vah264dec",
         "vapostproc",
         "videorate",
+        "videoscale",
     ] {
         report_plugin(plugin);
     }
