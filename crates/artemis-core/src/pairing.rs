@@ -92,9 +92,10 @@ pub fn pair(
         let _ = client.request_http("unpair", &[], false);
         return Ok(PairingOutcome::AlreadyInProgress);
     };
-    let certificate_der = hex::decode(plain_certificate)
+    let certificate_pem = hex::decode(plain_certificate)
         .map_err(|error| Error::Pairing(format!("invalid host certificate encoding: {error}")))?;
-    let server_certificate = X509::from_der(&certificate_der)?;
+    let server_certificate = X509::from_pem(&certificate_pem)?;
+    let certificate_der = server_certificate.to_der()?;
     client.set_pinned_certificate(certificate_der.clone());
 
     let result = complete_pairing(client, digest, &key, &server_certificate, &certificate_der);
