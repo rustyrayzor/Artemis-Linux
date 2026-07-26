@@ -352,7 +352,8 @@ impl AudioPipeline {
             ));
         }
         let timeline = AudioTimeline::new(sample_rate, samples_per_frame)?;
-        let description = audio_pipeline_description(sample_rate, channels, audio_sink_sync());
+        let pipewire_available = gst::ElementFactory::find("pipewiresink").is_some();
+        let description = audio_pipeline_description(sample_rate, channels, pipewire_available);
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
             .downcast::<gst::Pipeline>()
@@ -414,21 +415,15 @@ impl AudioPipeline {
     }
 }
 
-fn audio_sink_sync() -> bool {
-    matches!(
-        std::env::var("ARTEMIS_AUDIO_SINK_SYNC").as_deref(),
-        Ok("1" | "true" | "yes")
-    )
-}
-
-fn audio_pipeline_description(sample_rate: i32, channels: i32, sink_sync: bool) -> String {
-    // Match Moonlight's working PipeWire-Pulse path on the reference host: float samples,
-    // a 3.75 ms write quantum, and a 15 ms device buffer. GStreamer's Opus path can deliver
-    // decoded frames in scheduler-sized bursts, so hold 200 ms before releasing playback and
-    // rebuffer whenever the reservoir falls below that threshold. Without this reservoir,
-    // PipeWire repeats its last DMA period during the gaps, which sounds like clipped echo.
-    // Pulse owns playback pacing just as SDL's queued-audio backend does. The environment
-    // override is retained for beta diagnostics and controlled comparisons.
+fn audio_pipeline_description(sample_rate: i32, channels: i32, pipewire_available: bool) -> String {
+    // The reference host's Pulse compatibility path clips even low-amplitude test tones while
+    // native PipeWire preserves them. Prefer PipeWire and let its clock pace playback. Retain a
+    // clocked Pulse fallback for environments where the PipeWire GStreamer plugin is unavailable.
+    let sink = if pipewire_available {
+        "pipewiresink sync=true"
+    } else {
+        "pulsesink sync=true buffer-time=15000 latency-time=3750"
+    };
     format!(
         "appsrc name=audio_src is-live=true format=time do-timestamp=false \
          caps=audio/x-opus,rate={sample_rate},channels={channels},\
@@ -437,9 +432,7 @@ fn audio_pipeline_description(sample_rate: i32, channels: i32, sink_sync: bool) 
          audioresample ! \
          audio/x-raw,format=F32LE,rate={sample_rate},channels={channels} ! \
          tee name=audio_tee \
-         audio_tee. ! queue max-size-buffers=0 max-size-bytes=0 \
-         max-size-time=300000000 min-threshold-time=200000000 ! \
-         pulsesink sync={sink_sync} buffer-time=15000 latency-time=3750"
+         audio_tee. ! queue ! {sink}"
     )
 }
 
@@ -565,15 +558,24 @@ mod tests {
     }
 
     #[test]
-    fn pulse_owns_audio_pacing_by_default() {
-        let description = audio_pipeline_description(48_000, 2, false);
+    fn native_pipewire_sink_owns_audio_pacing_without_an_artificial_reservoir() {
+        let description = audio_pipeline_description(48_000, 2, true);
 
         assert!(description.contains("audio/x-raw,format=F32LE,rate=48000,channels=2"));
-        assert!(description.contains(
-            "queue max-size-buffers=0 max-size-bytes=0 \
-             max-size-time=300000000 min-threshold-time=200000000"
-        ));
-        assert!(description.contains("pulsesink sync=false buffer-time=15000 latency-time=3750"));
+        assert!(description.contains("queue ! pipewiresink sync=true"));
+        assert!(!description.contains("min-threshold-time"));
+        assert!(!description.contains("pulsesink"));
+    }
+
+    #[test]
+    fn clocked_pulse_sink_is_retained_as_a_plugin_fallback() {
+        let description = audio_pipeline_description(48_000, 2, false);
+
+        assert!(
+            description.contains("queue ! pulsesink sync=true buffer-time=15000 latency-time=3750")
+        );
+        assert!(!description.contains("min-threshold-time"));
+        assert!(!description.contains("pipewiresink"));
     }
 
     #[test]
