@@ -423,10 +423,12 @@ fn audio_sink_sync() -> bool {
 
 fn audio_pipeline_description(sample_rate: i32, channels: i32, sink_sync: bool) -> String {
     // Match Moonlight's working PipeWire-Pulse path on the reference host: float samples,
-    // a 3.75 ms write quantum, and a 15 ms device buffer. Pulse owns playback pacing just as
-    // SDL's queued-audio backend does; synchronizing a second GStreamer clock can turn small
-    // network scheduling corrections into audible repeats. The environment override is retained
-    // for beta diagnostics and controlled comparisons.
+    // a 3.75 ms write quantum, and a 15 ms device buffer. GStreamer's Opus path can deliver
+    // decoded frames in scheduler-sized bursts, so hold 200 ms before releasing playback and
+    // rebuffer whenever the reservoir falls below that threshold. Without this reservoir,
+    // PipeWire repeats its last DMA period during the gaps, which sounds like clipped echo.
+    // Pulse owns playback pacing just as SDL's queued-audio backend does. The environment
+    // override is retained for beta diagnostics and controlled comparisons.
     format!(
         "appsrc name=audio_src is-live=true format=time do-timestamp=false \
          caps=audio/x-opus,rate={sample_rate},channels={channels},\
@@ -435,7 +437,8 @@ fn audio_pipeline_description(sample_rate: i32, channels: i32, sink_sync: bool) 
          audioresample ! \
          audio/x-raw,format=F32LE,rate={sample_rate},channels={channels} ! \
          tee name=audio_tee \
-         audio_tee. ! queue ! \
+         audio_tee. ! queue max-size-buffers=0 max-size-bytes=0 \
+         max-size-time=300000000 min-threshold-time=200000000 ! \
          pulsesink sync={sink_sync} buffer-time=15000 latency-time=3750"
     )
 }
@@ -566,6 +569,10 @@ mod tests {
         let description = audio_pipeline_description(48_000, 2, false);
 
         assert!(description.contains("audio/x-raw,format=F32LE,rate=48000,channels=2"));
+        assert!(description.contains(
+            "queue max-size-buffers=0 max-size-bytes=0 \
+             max-size-time=300000000 min-threshold-time=200000000"
+        ));
         assert!(description.contains("pulsesink sync=false buffer-time=15000 latency-time=3750"));
     }
 
