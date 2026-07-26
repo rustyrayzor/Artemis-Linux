@@ -93,14 +93,10 @@ impl EventReceiver {
     pub fn try_recv(&self) -> std::result::Result<StreamEvent, TryRecvError> {
         match self.control.try_recv() {
             Ok(event) => Ok(event),
-            Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
-                match self.audio.try_recv() {
-                    Ok(event) => Ok(event),
-                    Err(TryRecvError::Disconnected | TryRecvError::Empty) => {
-                        self.video.try_recv()
-                    }
-                }
-            }
+            Err(TryRecvError::Disconnected | TryRecvError::Empty) => match self.audio.try_recv() {
+                Ok(event) => Ok(event),
+                Err(TryRecvError::Disconnected | TryRecvError::Empty) => self.video.try_recv(),
+            },
         }
     }
 }

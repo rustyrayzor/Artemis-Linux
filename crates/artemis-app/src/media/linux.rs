@@ -288,10 +288,7 @@ impl AudioPipeline {
             .unwrap_or(gst::ClockTime::ZERO);
         let (pts, duration) = self.timeline.next(start);
         if packet.is_empty() {
-            if self
-                .source
-                .send_event(gst::event::Gap::new(pts, duration))
-            {
+            if self.source.send_event(gst::event::Gap::new(pts, duration)) {
                 return Ok(());
             }
             return Err("GStreamer rejected an Opus packet-loss gap".to_owned());
@@ -343,9 +340,7 @@ mod tests {
         let mut timeline = AudioTimeline::new(48_000, 240).expect("valid Opus timing");
         let start = gst::ClockTime::from_mseconds(500);
 
-        let timestamps = (0..4)
-            .map(|_| timeline.next(start).0)
-            .collect::<Vec<_>>();
+        let timestamps = (0..4).map(|_| timeline.next(start).0).collect::<Vec<_>>();
 
         assert_eq!(
             timestamps,
