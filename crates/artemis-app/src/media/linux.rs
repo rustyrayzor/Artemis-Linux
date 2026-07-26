@@ -325,8 +325,9 @@ impl AudioPipeline {
             ));
         }
         let timeline = AudioTimeline::new(sample_rate, samples_per_frame)?;
-        // The dedicated audio worker feeds packets at Moonlight's playback cadence. Keep the
-        // sink clocked so short callback batches cannot overrun the device buffer.
+        // The dedicated audio worker feeds packets at Moonlight's playback cadence. Use native
+        // PipeWire so PulseAudio compatibility buffering cannot inflate the playback quantum and
+        // replay stale device data during an underrun.
         let description = format!(
             "appsrc name=audio_src is-live=true format=time do-timestamp=false \
              caps=audio/x-opus,rate={sample_rate},channels={channels},\
@@ -335,7 +336,7 @@ impl AudioPipeline {
              audioresample ! \
              audio/x-raw,format=S16LE,rate={sample_rate},channels={channels} ! \
              tee name=audio_tee \
-             audio_tee. ! queue ! autoaudiosink sync=true"
+             audio_tee. ! queue ! pipewiresink sync=true"
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
