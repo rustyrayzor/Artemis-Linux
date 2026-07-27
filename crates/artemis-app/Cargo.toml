@@ -23,6 +23,7 @@ tracing-subscriber.workspace = true
 gilrs.workspace = true
 gstreamer.workspace = true
 gstreamer-app.workspace = true
+gstreamer-video.workspace = true
 
 [lints]
 workspace = true

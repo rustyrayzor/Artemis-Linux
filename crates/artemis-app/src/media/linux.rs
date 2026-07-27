@@ -13,6 +13,8 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
+use gstreamer_video::VideoFrameExt;
 
 use artemis_moonlight::{AudioEventReceiver, StreamEvent, VideoEventReceiver};
 
@@ -292,23 +294,45 @@ impl VideoPipeline {
                         return Ok(gst::FlowSuccess::Ok);
                     }
                     let caps = sample.caps().ok_or(gst::FlowError::NotNegotiated)?;
-                    let structure = caps.structure(0).ok_or(gst::FlowError::NotNegotiated)?;
-                    let width = structure
-                        .get::<i32>("width")
+                    let info = gst_video::VideoInfo::from_caps(caps)
                         .map_err(|_| gst::FlowError::NotNegotiated)?;
-                    let height = structure
-                        .get::<i32>("height")
-                        .map_err(|_| gst::FlowError::NotNegotiated)?;
+                    if info.format() != gst_video::VideoFormat::Nv12 {
+                        return Err(gst::FlowError::NotNegotiated);
+                    }
+                    let width = usize::try_from(info.width()).map_err(|_| gst::FlowError::Error)?;
+                    let height =
+                        usize::try_from(info.height()).map_err(|_| gst::FlowError::Error)?;
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                    let width = usize::try_from(width).map_err(|_| gst::FlowError::Error)?;
-                    let height = usize::try_from(height).map_err(|_| gst::FlowError::Error)?;
-                    let bytes = map.as_slice();
-                    let nv12 = copy_visible_nv12(bytes, width, height).map_err(|error| {
+                    let video_frame =
+                        gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+                            .map_err(|_| gst::FlowError::Error)?;
+                    let strides = video_frame.plane_stride();
+                    let luma_stride =
+                        usize::try_from(strides[0]).map_err(|_| gst::FlowError::Error)?;
+                    let chroma_stride =
+                        usize::try_from(strides[1]).map_err(|_| gst::FlowError::Error)?;
+                    let luma = video_frame
+                        .plane_data(0)
+                        .map_err(|_| gst::FlowError::Error)?;
+                    let chroma = video_frame
+                        .plane_data(1)
+                        .map_err(|_| gst::FlowError::Error)?;
+                    let nv12 = copy_visible_nv12_planes(
+                        luma,
+                        luma_stride,
+                        chroma,
+                        chroma_stride,
+                        width,
+                        height,
+                    )
+                    .map_err(|error| {
                         tracing::error!(
                             width,
                             height,
-                            actual_bytes = bytes.len(),
+                            luma_bytes = luma.len(),
+                            chroma_bytes = chroma.len(),
+                            luma_stride,
+                            chroma_stride,
                             error,
                             "decoded NV12 buffer has an unsupported layout"
                         );
@@ -362,9 +386,19 @@ fn rate_per_second(current: u64, previous: u64, seconds: f64) -> f64 {
     f64::from(frames) / seconds
 }
 
-fn copy_visible_nv12(bytes: &[u8], width: usize, height: usize) -> Result<Vec<u8>, &'static str> {
+fn copy_visible_nv12_planes(
+    luma: &[u8],
+    luma_stride: usize,
+    chroma: &[u8],
+    chroma_stride: usize,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>, &'static str> {
     if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
         return Err("dimensions must be non-zero and even");
+    }
+    if luma_stride < width || chroma_stride < width {
+        return Err("plane stride is shorter than the visible width");
     }
     let visible_luma = width
         .checked_mul(height)
@@ -372,38 +406,13 @@ fn copy_visible_nv12(bytes: &[u8], width: usize, height: usize) -> Result<Vec<u8
     let visible_bytes = visible_luma
         .checked_add(visible_luma / 2)
         .ok_or("visible buffer size overflowed")?;
-    if bytes.len() == visible_bytes {
-        return Ok(bytes.to_vec());
-    }
-
-    // The Intel VA-API decoder uses the visible width as its stride for the supported presets,
-    // but pads the storage height to a hardware alignment (for example 1440 to 1472). Derive that
-    // padded height from the standard NV12 3:2 plane-size ratio and copy only visible rows.
-    let doubled_size = bytes
-        .len()
-        .checked_mul(2)
-        .ok_or("storage buffer size overflowed")?;
-    let three_width = width.checked_mul(3).ok_or("storage width overflowed")?;
-    if doubled_size % three_width != 0 {
-        return Err("storage stride differs from the visible width");
-    }
-    let storage_height = doubled_size / three_width;
-    if storage_height < height || storage_height % 2 != 0 {
-        return Err("storage height is invalid");
-    }
-    let storage_luma = width
-        .checked_mul(storage_height)
-        .ok_or("storage dimensions overflowed")?;
-    if storage_luma > bytes.len() {
-        return Err("luma plane extends past the buffer");
-    }
 
     let mut visible = Vec::with_capacity(visible_bytes);
-    for row in bytes[..storage_luma].chunks_exact(width).take(height) {
-        visible.extend_from_slice(row);
+    for row in luma.chunks_exact(luma_stride).take(height) {
+        visible.extend_from_slice(&row[..width]);
     }
-    for row in bytes[storage_luma..].chunks_exact(width).take(height / 2) {
-        visible.extend_from_slice(row);
+    for row in chroma.chunks_exact(chroma_stride).take(height / 2) {
+        visible.extend_from_slice(&row[..width]);
     }
     if visible.len() != visible_bytes {
         return Err("chroma plane is shorter than expected");
@@ -844,7 +853,7 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioOutput, AudioTimeline, audio_pipeline_description, copy_visible_nv12,
+        AudioOutput, AudioTimeline, audio_pipeline_description, copy_visible_nv12_planes,
         video_decoder_chain, video_pipeline_description,
     };
     use gstreamer as gst;
@@ -940,7 +949,8 @@ mod tests {
             32, 33, 34, 35, // padded chroma row
         ];
 
-        let visible = copy_visible_nv12(&padded, 4, 4).expect("supported padded NV12");
+        let visible = copy_visible_nv12_planes(&padded[..24], 4, &padded[24..], 4, 4, 4)
+            .expect("supported padded NV12");
 
         assert_eq!(
             visible,
@@ -956,7 +966,8 @@ mod tests {
         let packed = (0..24).collect::<Vec<_>>();
 
         assert_eq!(
-            copy_visible_nv12(&packed, 4, 4).expect("supported packed NV12"),
+            copy_visible_nv12_planes(&packed[..16], 4, &packed[16..], 4, 4, 4)
+                .expect("supported packed NV12"),
             packed
         );
     }
