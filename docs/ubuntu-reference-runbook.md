@@ -67,6 +67,7 @@ ARTEMIS_AUTOSTART_APP=Desktop \
 ARTEMIS_AUTOSTART_PRESET=4K60 \
 ARTEMIS_AUTOSTART_BITRATE_MBPS=40 \
 ARTEMIS_AUTOSTART_FULLSCREEN=true \
+ARTEMIS_AUTOSTOP_AFTER_SECONDS=60 \
 ./artemis-linux
 ```
 
@@ -74,6 +75,8 @@ Both the host and application variables are required. The preset accepts
 `1080p60`, `1440p60`, `4K60`, or `2160p60`; bitrate remains constrained to the
 same 10–300 Mbps range as the UI. These variables are intended for repeatable
 reference-host diagnostics and are ignored when the required pair is absent.
+The optional autostop value accepts 5–3600 seconds and cleanly disconnects,
+closes fullscreen, and exits after the native session reaches connected state.
 
 Capture `RUST_LOG=artemis=debug` output for any failure. Never include private
 keys or certificate contents in a diagnostic bundle.

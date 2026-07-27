@@ -1,5 +1,5 @@
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use artemis_core::{
     Application, ClientIdentity, HostAddress, HostRecord, HostStore, LaunchResult, NvClient,
@@ -21,6 +21,7 @@ const AUTOSTART_APP_ENV: &str = "ARTEMIS_AUTOSTART_APP";
 const AUTOSTART_PRESET_ENV: &str = "ARTEMIS_AUTOSTART_PRESET";
 const AUTOSTART_BITRATE_ENV: &str = "ARTEMIS_AUTOSTART_BITRATE_MBPS";
 const AUTOSTART_FULLSCREEN_ENV: &str = "ARTEMIS_AUTOSTART_FULLSCREEN";
+const AUTOSTOP_AFTER_ENV: &str = "ARTEMIS_AUTOSTOP_AFTER_SECONDS";
 
 pub struct ArtemisApp {
     identity: ClientIdentity,
@@ -46,6 +47,8 @@ pub struct ArtemisApp {
     fullscreen: bool,
     pending_autostart: Option<AutostartRequest>,
     fullscreen_on_connect: bool,
+    autostop_after_connect: Option<Duration>,
+    autostop_deadline: Option<Instant>,
 }
 
 struct ActiveStream {
@@ -67,6 +70,7 @@ struct AutostartRequest {
     preset: StreamPreset,
     bitrate: StreamBitrate,
     fullscreen: bool,
+    autostop_after: Option<Duration>,
 }
 
 enum TaskMessage {
@@ -163,6 +167,8 @@ impl ArtemisApp {
             fullscreen: false,
             pending_autostart,
             fullscreen_on_connect: false,
+            autostop_after_connect: None,
+            autostop_deadline: None,
         };
         if let Some(request) = &app.pending_autostart {
             tracing::info!(
@@ -451,6 +457,7 @@ impl ArtemisApp {
                                         "launching diagnostic autostart application"
                                     );
                                     self.fullscreen_on_connect = request.fullscreen;
+                                    self.autostop_after_connect = request.autostop_after;
                                     self.launch(application);
                                 } else {
                                     self.status = format!(
@@ -562,6 +569,10 @@ impl ArtemisApp {
                 }
                 StreamEvent::Connected => {
                     active.connected = true;
+                    self.autostop_deadline = self
+                        .autostop_after_connect
+                        .take()
+                        .map(|duration| Instant::now() + duration);
                     self.status = format!(
                         "Streaming {} at {}.",
                         active.app_title, active.profile_label
@@ -582,6 +593,16 @@ impl ArtemisApp {
                 | StreamEvent::AudioSetup { .. }
                 | StreamEvent::AudioPacket(_) => {}
             }
+        }
+        if self
+            .autostop_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            tracing::info!("diagnostic autostop deadline reached; disconnecting cleanly");
+            self.autostop_deadline = None;
+            self.disconnect(context, false);
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
 
         if let Some(active) = &mut self.active_stream {
@@ -659,6 +680,8 @@ impl ArtemisApp {
         active.controller.disconnect(&mut active.session);
         active.media.shutdown();
         active.session.stop();
+        self.autostop_deadline = None;
+        self.autostop_after_connect = None;
         self.set_fullscreen(context, false);
         context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
         context.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
@@ -1023,6 +1046,7 @@ fn autostart_from_environment() -> std::result::Result<Option<AutostartRequest>,
         std::env::var(AUTOSTART_PRESET_ENV).ok().as_deref(),
         std::env::var(AUTOSTART_BITRATE_ENV).ok().as_deref(),
         std::env::var(AUTOSTART_FULLSCREEN_ENV).ok().as_deref(),
+        std::env::var(AUTOSTOP_AFTER_ENV).ok().as_deref(),
     )
 }
 
@@ -1032,6 +1056,7 @@ fn autostart_from_values(
     preset: Option<&str>,
     bitrate_mbps: Option<&str>,
     fullscreen: Option<&str>,
+    autostop_after_seconds: Option<&str>,
 ) -> std::result::Result<Option<AutostartRequest>, String> {
     let (Some(host), Some(application)) = (host, application) else {
         if host.is_some() || application.is_some() {
@@ -1071,12 +1096,26 @@ fn autostart_from_values(
             ));
         }
     };
+    let autostop_after = autostop_after_seconds
+        .map(|value| {
+            let seconds = value
+                .parse::<u64>()
+                .map_err(|_| format!("{AUTOSTOP_AFTER_ENV} must be a whole number"))?;
+            if !(5..=3_600).contains(&seconds) {
+                return Err(format!(
+                    "{AUTOSTOP_AFTER_ENV} must be between 5 and 3600 seconds"
+                ));
+            }
+            Ok(Duration::from_secs(seconds))
+        })
+        .transpose()?;
     Ok(Some(AutostartRequest {
         address,
         application_title: application_title.to_owned(),
         preset,
         bitrate,
         fullscreen,
+        autostop_after,
     }))
 }
 
@@ -1093,6 +1132,8 @@ fn parse_autostart_preset(value: &str) -> std::result::Result<StreamPreset, Stri
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use artemis_core::StreamPreset;
 
     use super::{AUTOSTART_APP_ENV, autostart_from_values, parse_manual_host};
@@ -1119,6 +1160,7 @@ mod tests {
             Some("4K60"),
             Some("40"),
             Some("true"),
+            Some("30"),
         )
         .expect("valid configuration")
         .expect("autostart request");
@@ -1128,12 +1170,20 @@ mod tests {
         assert_eq!(request.preset, StreamPreset::UltraHd60);
         assert_eq!(request.bitrate.mbps(), 40);
         assert!(request.fullscreen);
+        assert_eq!(request.autostop_after, Some(Duration::from_secs(30)));
     }
 
     #[test]
     fn requires_both_autostart_target_values() {
-        let error = autostart_from_values(Some("192.168.100.128"), None, Some("4K60"), None, None)
-            .expect_err("incomplete configuration");
+        let error = autostart_from_values(
+            Some("192.168.100.128"),
+            None,
+            Some("4K60"),
+            None,
+            None,
+            None,
+        )
+        .expect_err("incomplete configuration");
 
         assert!(error.contains(AUTOSTART_APP_ENV));
     }
