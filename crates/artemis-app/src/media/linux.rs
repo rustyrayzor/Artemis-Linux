@@ -381,7 +381,7 @@ impl PipeWirePlayer {
     fn input_fd(&self) -> Result<i32, String> {
         self.stdin
             .as_ref()
-            .map(|stdin| stdin.as_raw_fd())
+            .map(AsRawFd::as_raw_fd)
             .ok_or_else(|| "pw-play input is closed".to_owned())
     }
 }
