@@ -6,7 +6,7 @@ use artemis_core::{
     PairingOutcome, ServerInfo, StreamBitrate, StreamPreset, cancel_host_application, discover,
     generate_pin, launch_application, list_applications, pair, stereo_audio_configuration,
 };
-use artemis_moonlight::{EventReceiver, Session, StreamConfig, StreamEvent};
+use artemis_moonlight::{ConnectionQuality, EventReceiver, Session, StreamConfig, StreamEvent};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{self, Color32, RichText, TextureHandle, TextureOptions};
 
@@ -464,6 +464,15 @@ impl ArtemisApp {
                         active.app_title, active.profile_label
                     );
                 }
+                StreamEvent::ConnectionStatus(ConnectionQuality::Okay) => {
+                    self.status = format!(
+                        "Streaming {} at {}.",
+                        active.app_title, active.profile_label
+                    );
+                }
+                StreamEvent::ConnectionStatus(ConnectionQuality::Poor) => {
+                    self.status = "The stream connection is unstable.".to_owned();
+                }
                 StreamEvent::Terminated(error) => terminated = Some(error),
                 event @ (StreamEvent::VideoSetup { .. }
                 | StreamEvent::VideoFrame { .. }
@@ -483,17 +492,16 @@ impl ArtemisApp {
                 active.input.forward(context, &mut active.session);
             }
             if let Some(frame) = active.media.try_frame() {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width, frame.height],
-                    &frame.rgba,
-                );
+                let image = frame.image;
                 if let Some(texture) = &mut self.texture {
                     texture.set(image, TextureOptions::LINEAR);
                 } else {
                     self.texture =
                         Some(context.load_texture("artemis-stream", image, TextureOptions::LINEAR));
                 }
+                active.media.record_presented();
             }
+            active.media.report_video_stats();
             if let Some(error) = active.media.poll_error() {
                 self.status = error;
                 active.session.request_idr();

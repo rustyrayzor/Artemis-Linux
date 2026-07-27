@@ -1,9 +1,9 @@
+use eframe::egui;
+
 use artemis_moonlight::{AudioEventReceiver, StreamEvent};
 
 pub struct DecodedFrame {
-    pub width: usize,
-    pub height: usize,
-    pub rgba: Vec<u8>,
+    pub image: egui::ColorImage,
 }
 
 pub struct MediaRuntime;
@@ -21,6 +21,10 @@ impl MediaRuntime {
     pub fn try_frame(&self) -> Option<DecodedFrame> {
         None
     }
+
+    pub fn record_presented(&self) {}
+
+    pub fn report_video_stats(&mut self) {}
 
     pub fn poll_error(&self) -> Option<String> {
         None

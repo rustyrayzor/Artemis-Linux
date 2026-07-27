@@ -2,10 +2,15 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use eframe::egui;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -13,9 +18,34 @@ use gstreamer_app as gst_app;
 use artemis_moonlight::{AudioEventReceiver, StreamEvent};
 
 pub struct DecodedFrame {
-    pub width: usize,
-    pub height: usize,
-    pub rgba: Vec<u8>,
+    pub image: egui::ColorImage,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoStats {
+    pub submitted: u64,
+    pub decoded: u64,
+    pub dropped: u64,
+    pub presented: u64,
+}
+
+#[derive(Default)]
+struct VideoCounters {
+    submitted: AtomicU64,
+    decoded: AtomicU64,
+    dropped: AtomicU64,
+    presented: AtomicU64,
+}
+
+impl VideoCounters {
+    fn snapshot(&self) -> VideoStats {
+        VideoStats {
+            submitted: self.submitted.load(Ordering::Relaxed),
+            decoded: self.decoded.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            presented: self.presented.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub struct MediaRuntime {
@@ -23,17 +53,24 @@ pub struct MediaRuntime {
     audio: AudioWorker,
     frames: Receiver<DecodedFrame>,
     frame_sender: crossbeam_channel::Sender<DecodedFrame>,
+    video_counters: Arc<VideoCounters>,
+    last_video_report_at: Instant,
+    last_video_report: VideoStats,
 }
 
 impl MediaRuntime {
     pub fn new(audio_events: AudioEventReceiver) -> Result<Self, String> {
         gst::init().map_err(|error| error.to_string())?;
         let (frame_sender, frames) = bounded(2);
+        let video_counters = Arc::new(VideoCounters::default());
         Ok(Self {
             video: None,
             audio: AudioWorker::spawn(audio_events)?,
             frames,
             frame_sender,
+            video_counters,
+            last_video_report_at: Instant::now(),
+            last_video_report: VideoStats::default(),
         })
     }
 
@@ -55,6 +92,7 @@ impl MediaRuntime {
                     height,
                     fps,
                     self.frame_sender.clone(),
+                    Arc::clone(&self.video_counters),
                 )?);
             }
             StreamEvent::VideoFrame {
@@ -74,9 +112,45 @@ impl MediaRuntime {
     pub fn try_frame(&self) -> Option<DecodedFrame> {
         let mut latest = None;
         while let Ok(frame) = self.frames.try_recv() {
-            latest = Some(frame);
+            if latest.replace(frame).is_some() {
+                self.video_counters.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
         latest
+    }
+
+    pub fn record_presented(&self) {
+        self.video_counters
+            .presented
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn report_video_stats(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_video_report_at);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let current = self.video_counters.snapshot();
+        let seconds = elapsed.as_secs_f64();
+        let submitted_fps =
+            rate_per_second(current.submitted, self.last_video_report.submitted, seconds);
+        let decoded_fps = rate_per_second(current.decoded, self.last_video_report.decoded, seconds);
+        let presented_fps =
+            rate_per_second(current.presented, self.last_video_report.presented, seconds);
+        let dropped = current
+            .dropped
+            .saturating_sub(self.last_video_report.dropped);
+        tracing::info!(
+            target: "artemis::video",
+            submitted_fps,
+            decoded_fps,
+            presented_fps,
+            dropped,
+            "video pipeline throughput"
+        );
+        self.last_video_report = current;
+        self.last_video_report_at = now;
     }
 
     pub fn poll_error(&self) -> Option<String> {
@@ -95,6 +169,7 @@ impl MediaRuntime {
 struct VideoPipeline {
     pipeline: gst::Pipeline,
     source: gst_app::AppSrc,
+    video_counters: Arc<VideoCounters>,
 }
 
 impl VideoPipeline {
@@ -103,6 +178,7 @@ impl VideoPipeline {
         height: i32,
         _fps: i32,
         frames: crossbeam_channel::Sender<DecodedFrame>,
+        video_counters: Arc<VideoCounters>,
     ) -> Result<Self, String> {
         let has_va_decoder = gst::ElementFactory::find("vah264dec").is_some()
             && gst::ElementFactory::find("vapostproc").is_some();
@@ -121,11 +197,14 @@ impl VideoPipeline {
             .ok_or_else(|| "video appsink is missing".to_owned())?
             .downcast::<gst_app::AppSink>()
             .map_err(|_| "video sink has the wrong GStreamer type".to_owned())?;
+        let callback_counters = Arc::clone(&video_counters);
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    callback_counters.decoded.fetch_add(1, Ordering::Relaxed);
                     if frames.is_full() {
+                        callback_counters.dropped.fetch_add(1, Ordering::Relaxed);
                         return Ok(gst::FlowSuccess::Ok);
                     }
                     let caps = sample.caps().ok_or(gst::FlowError::NotNegotiated)?;
@@ -139,9 +218,13 @@ impl VideoPipeline {
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                     let frame = DecodedFrame {
-                        width: usize::try_from(width).map_err(|_| gst::FlowError::Error)?,
-                        height: usize::try_from(height).map_err(|_| gst::FlowError::Error)?,
-                        rgba: map.as_slice().to_vec(),
+                        image: egui::ColorImage::from_rgba_unmultiplied(
+                            [
+                                usize::try_from(width).map_err(|_| gst::FlowError::Error)?,
+                                usize::try_from(height).map_err(|_| gst::FlowError::Error)?,
+                            ],
+                            map.as_slice(),
+                        ),
                     };
                     let _ = frames.try_send(frame);
                     Ok(gst::FlowSuccess::Ok)
@@ -151,7 +234,11 @@ impl VideoPipeline {
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|error| error.to_string())?;
-        Ok(Self { pipeline, source })
+        Ok(Self {
+            pipeline,
+            source,
+            video_counters,
+        })
     }
 
     fn push(
@@ -160,6 +247,9 @@ impl VideoPipeline {
         key_frame: bool,
         presentation_time_us: u64,
     ) -> Result<(), String> {
+        self.video_counters
+            .submitted
+            .fetch_add(1, Ordering::Relaxed);
         let mut buffer = gst::Buffer::from_mut_slice(bytes);
         if let Some(buffer) = buffer.get_mut() {
             buffer.set_pts(gst::ClockTime::from_useconds(presentation_time_us));
@@ -172,6 +262,11 @@ impl VideoPipeline {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+}
+
+fn rate_per_second(current: u64, previous: u64, seconds: f64) -> f64 {
+    let frames = u32::try_from(current.saturating_sub(previous)).unwrap_or(u32::MAX);
+    f64::from(frames) / seconds
 }
 
 impl Drop for VideoPipeline {

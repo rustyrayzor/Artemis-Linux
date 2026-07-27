@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Sender, bounded, unbounded};
 
-use crate::{Error, EventReceiver, Result, StreamConfig, StreamEvent};
+use crate::{
+    ConnectionQuality, Error, EventReceiver, NetworkStats, Result, StreamConfig, StreamEvent,
+};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -36,6 +38,7 @@ struct NativeStartConfig {
 type StageCallback = extern "C" fn(*mut c_void, *const c_char, i32, i32);
 type ConnectedCallback = extern "C" fn(*mut c_void);
 type TerminatedCallback = extern "C" fn(*mut c_void, i32);
+type ConnectionStatusCallback = extern "C" fn(*mut c_void, i32);
 type VideoSetupCallback = extern "C" fn(*mut c_void, i32, i32, i32, i32) -> i32;
 type VideoFrameCallback = extern "C" fn(*mut c_void, *const u8, usize, i32, u64);
 type AudioSetupCallback =
@@ -48,6 +51,7 @@ struct NativeCallbacks {
     stage: Option<StageCallback>,
     connected: Option<ConnectedCallback>,
     terminated: Option<TerminatedCallback>,
+    connection_status: Option<ConnectionStatusCallback>,
     video_setup: Option<VideoSetupCallback>,
     video_frame: Option<VideoFrameCallback>,
     audio_setup: Option<AudioSetupCallback>,
@@ -59,6 +63,21 @@ struct NativeSession {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+#[derive(Default)]
+struct NativeNetworkStats {
+    audio_packets: u32,
+    audio_fec_recovered: u32,
+    audio_fec_failed: u32,
+    audio_out_of_sequence: u32,
+    audio_invalid: u32,
+    video_packets: u32,
+    video_fec_recovered: u32,
+    video_fec_failed: u32,
+    video_out_of_sequence: u32,
+    video_invalid: u32,
+}
+
 unsafe extern "C" {
     fn aml_session_create(
         config: *const NativeStartConfig,
@@ -68,6 +87,10 @@ unsafe extern "C" {
     fn aml_session_interrupt(session: *mut NativeSession);
     fn aml_session_stop(session: *mut NativeSession);
     fn aml_session_destroy(session: *mut NativeSession);
+    fn aml_session_network_stats(
+        session: *mut NativeSession,
+        stats: *mut NativeNetworkStats,
+    ) -> i32;
     fn aml_mouse_move(session: *mut NativeSession, x: i16, y: i16) -> i32;
     fn aml_mouse_button(session: *mut NativeSession, action: u8, button: i32) -> i32;
     fn aml_scroll(session: *mut NativeSession, vertical: i16, horizontal: i16) -> i32;
@@ -183,6 +206,7 @@ impl Session {
             stage: Some(on_stage),
             connected: Some(on_connected),
             terminated: Some(on_terminated),
+            connection_status: Some(on_connection_status),
             video_setup: Some(on_video_setup),
             video_frame: Some(on_video_frame),
             audio_setup: Some(on_audio_setup),
@@ -301,6 +325,25 @@ impl Session {
         // SAFETY: The native handle is valid and the shim ignores inactive sessions.
         unsafe { aml_request_idr(self.native.as_ptr()) };
     }
+
+    pub fn network_stats(&self) -> Result<NetworkStats> {
+        let mut stats = NativeNetworkStats::default();
+        // SAFETY: The native handle is live and `stats` points to writable storage matching
+        // the C ABI for the duration of this synchronous call.
+        check(unsafe { aml_session_network_stats(self.native.as_ptr(), &mut stats) })?;
+        Ok(NetworkStats {
+            audio_packets: stats.audio_packets,
+            audio_fec_recovered: stats.audio_fec_recovered,
+            audio_fec_failed: stats.audio_fec_failed,
+            audio_out_of_sequence: stats.audio_out_of_sequence,
+            audio_invalid: stats.audio_invalid,
+            video_packets: stats.video_packets,
+            video_fec_recovered: stats.video_fec_recovered,
+            video_fec_failed: stats.video_fec_failed,
+            video_out_of_sequence: stats.video_out_of_sequence,
+            video_invalid: stats.video_invalid,
+        })
+    }
 }
 
 impl Drop for Session {
@@ -368,6 +411,20 @@ extern "C" fn on_terminated(userdata: *mut c_void, error: i32) {
         if let Some(context) = callback_context(userdata) {
             let _ = context.control.send(StreamEvent::Terminated(error));
         }
+    }));
+}
+
+extern "C" fn on_connection_status(userdata: *mut c_void, status: i32) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(context) = callback_context(userdata) else {
+            return;
+        };
+        let quality = if status == 0 {
+            ConnectionQuality::Okay
+        } else {
+            ConnectionQuality::Poor
+        };
+        let _ = context.control.send(StreamEvent::ConnectionStatus(quality));
     }));
 }
 

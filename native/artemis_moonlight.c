@@ -76,6 +76,13 @@ static void connection_terminated(int error) {
     }
 }
 
+static void connection_status_update(int status) {
+    AmlSession* session = active_session();
+    if (session != NULL && session->callbacks.connection_status != NULL) {
+        session->callbacks.connection_status(session->callbacks.userdata, status);
+    }
+}
+
 static int video_setup(
     int format,
     int width,
@@ -238,6 +245,7 @@ AmlSession* aml_session_create(
     session->connection_callbacks.stageFailed = stage_failed;
     session->connection_callbacks.connectionStarted = connection_started;
     session->connection_callbacks.connectionTerminated = connection_terminated;
+    session->connection_callbacks.connectionStatusUpdate = connection_status_update;
 
     LiInitializeVideoCallbacks(&session->video_callbacks);
     session->video_callbacks.setup = video_setup;
@@ -252,6 +260,33 @@ AmlSession* aml_session_create(
         CAPABILITY_DIRECT_SUBMIT |
         CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION;
     return session;
+}
+
+int32_t aml_session_network_stats(
+    AmlSession* session,
+    AmlNetworkStats* stats
+) {
+    if (session == NULL || stats == NULL || active_session() != session) {
+        return AML_ERR_INACTIVE;
+    }
+
+    const RTP_AUDIO_STATS* audio = LiGetRTPAudioStats();
+    const RTP_VIDEO_STATS* video = LiGetRTPVideoStats();
+    if (audio == NULL || video == NULL) {
+        return -1;
+    }
+
+    stats->audio_packets = audio->packetCountAudio;
+    stats->audio_fec_recovered = audio->packetCountFecRecovered;
+    stats->audio_fec_failed = audio->packetCountFecFailed;
+    stats->audio_out_of_sequence = audio->packetCountOOS;
+    stats->audio_invalid = audio->packetCountInvalid;
+    stats->video_packets = video->packetCountVideo;
+    stats->video_fec_recovered = video->packetCountFecRecovered;
+    stats->video_fec_failed = video->packetCountFecFailed;
+    stats->video_out_of_sequence = video->packetCountOOS;
+    stats->video_invalid = video->packetCountInvalid;
+    return 0;
 }
 
 int32_t aml_session_start(AmlSession* session) {

@@ -26,11 +26,25 @@ typedef struct AmlStartConfig {
     uint8_t remote_input_iv[16];
 } AmlStartConfig;
 
+typedef struct AmlNetworkStats {
+    uint32_t audio_packets;
+    uint32_t audio_fec_recovered;
+    uint32_t audio_fec_failed;
+    uint32_t audio_out_of_sequence;
+    uint32_t audio_invalid;
+    uint32_t video_packets;
+    uint32_t video_fec_recovered;
+    uint32_t video_fec_failed;
+    uint32_t video_out_of_sequence;
+    uint32_t video_invalid;
+} AmlNetworkStats;
+
 typedef struct AmlCallbacks {
     void* userdata;
     void (*stage)(void* userdata, const char* name, int32_t state, int32_t error);
     void (*connected)(void* userdata);
     void (*terminated)(void* userdata, int32_t error);
+    void (*connection_status)(void* userdata, int32_t status);
     int32_t (*video_setup)(
         void* userdata,
         int32_t format,
@@ -66,6 +80,10 @@ int32_t aml_session_start(AmlSession* session);
 void aml_session_interrupt(AmlSession* session);
 void aml_session_stop(AmlSession* session);
 void aml_session_destroy(AmlSession* session);
+int32_t aml_session_network_stats(
+    AmlSession* session,
+    AmlNetworkStats* stats
+);
 
 int32_t aml_mouse_move(AmlSession* session, int16_t x, int16_t y);
 int32_t aml_mouse_button(AmlSession* session, uint8_t action, int32_t button);

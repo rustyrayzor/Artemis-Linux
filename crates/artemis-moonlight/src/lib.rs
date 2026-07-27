@@ -23,6 +23,26 @@ pub const MODIFIER_CTRL: u8 = 0x02;
 pub const MODIFIER_ALT: u8 = 0x04;
 pub const MODIFIER_META: u8 = 0x08;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionQuality {
+    Okay,
+    Poor,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetworkStats {
+    pub audio_packets: u32,
+    pub audio_fec_recovered: u32,
+    pub audio_fec_failed: u32,
+    pub audio_out_of_sequence: u32,
+    pub audio_invalid: u32,
+    pub video_packets: u32,
+    pub video_fec_recovered: u32,
+    pub video_fec_failed: u32,
+    pub video_out_of_sequence: u32,
+    pub video_invalid: u32,
+}
+
 /// Native connection parameters copied into the C shim before connecting.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct StreamConfig {
@@ -53,6 +73,7 @@ pub enum StreamEvent {
     },
     Connected,
     Terminated(i32),
+    ConnectionStatus(ConnectionQuality),
     VideoSetup {
         format: i32,
         width: i32,
@@ -135,7 +156,7 @@ mod tests {
 
     use crossbeam_channel::{bounded, unbounded};
 
-    use super::{EventReceiver, StreamEvent};
+    use super::{ConnectionQuality, EventReceiver, StreamEvent};
 
     #[test]
     fn audio_is_received_before_droppable_video() {
@@ -199,6 +220,34 @@ mod tests {
         assert!(matches!(
             audio_receiver.recv_timeout(Duration::from_millis(10)),
             Ok(StreamEvent::AudioPacket(packet)) if packet == [2]
+        ));
+    }
+
+    #[test]
+    fn connection_quality_is_a_priority_control_event() {
+        let (control_sender, control) = unbounded();
+        let (_audio_sender, audio) = unbounded();
+        let (video_sender, video) = bounded(1);
+        let receiver = EventReceiver {
+            control,
+            audio,
+            video,
+        };
+
+        video_sender
+            .send(StreamEvent::VideoFrame {
+                bytes: vec![1],
+                key_frame: true,
+                presentation_time_us: 0,
+            })
+            .expect("video receiver should remain connected");
+        control_sender
+            .send(StreamEvent::ConnectionStatus(ConnectionQuality::Poor))
+            .expect("control receiver should remain connected");
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(StreamEvent::ConnectionStatus(ConnectionQuality::Poor))
         ));
     }
 }
