@@ -45,7 +45,7 @@ pub struct ArtemisApp {
     stream_preset: StreamPreset,
     stream_bitrate: StreamBitrate,
     fullscreen: bool,
-    diagnostics_overlay: bool,
+    diagnostics_overlay: DiagnosticsOverlay,
     pending_autostart: Option<AutostartRequest>,
     fullscreen_on_connect: bool,
     autostop_after_connect: Option<Duration>,
@@ -63,6 +63,26 @@ struct ActiveStream {
     profile_label: String,
     connected: bool,
     connection_quality: ConnectionQuality,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DiagnosticsOverlay {
+    Hidden,
+    Visible,
+}
+
+impl DiagnosticsOverlay {
+    fn is_visible(self) -> bool {
+        self == Self::Visible
+    }
+
+    fn toggle(&mut self) {
+        *self = if self.is_visible() {
+            Self::Hidden
+        } else {
+            Self::Visible
+        };
+    }
 }
 
 #[derive(Debug)]
@@ -167,7 +187,7 @@ impl ArtemisApp {
             stream_preset,
             stream_bitrate,
             fullscreen: false,
-            diagnostics_overlay: false,
+            diagnostics_overlay: DiagnosticsOverlay::Hidden,
             pending_autostart,
             fullscreen_on_connect: false,
             autostop_after_connect: None,
@@ -673,7 +693,7 @@ impl ArtemisApp {
             self.set_fullscreen(context, !self.fullscreen);
         }
         if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F10)) {
-            self.diagnostics_overlay = !self.diagnostics_overlay;
+            self.diagnostics_overlay.toggle();
         }
         if self.fullscreen
             && context
@@ -883,11 +903,21 @@ impl ArtemisApp {
                     .small()
                     .color(Color32::from_rgb(120, 119, 116)),
                 );
-                ui.checkbox(
-                    &mut self.diagnostics_overlay,
-                    "Show performance diagnostics while streaming",
-                )
-                .on_hover_text("Toggle during a stream with F10");
+                let mut diagnostics_enabled = self.diagnostics_overlay.is_visible();
+                if ui
+                    .checkbox(
+                        &mut diagnostics_enabled,
+                        "Show performance diagnostics while streaming",
+                    )
+                    .on_hover_text("Toggle during a stream with F10")
+                    .changed()
+                {
+                    self.diagnostics_overlay = if diagnostics_enabled {
+                        DiagnosticsOverlay::Visible
+                    } else {
+                        DiagnosticsOverlay::Hidden
+                    };
+                }
                 ui.add_space(24.0);
                 section_label(ui, "APPLICATIONS");
                 ui.add_space(8.0);
@@ -945,7 +975,7 @@ impl ArtemisApp {
                             self.set_fullscreen(context, true);
                         }
                         if ui
-                            .button(if self.diagnostics_overlay {
+                            .button(if self.diagnostics_overlay.is_visible() {
                                 "Hide diagnostics"
                             } else {
                                 "Diagnostics"
@@ -953,7 +983,7 @@ impl ArtemisApp {
                             .on_hover_text("Toggle performance diagnostics (F10)")
                             .clicked()
                         {
-                            self.diagnostics_overlay = !self.diagnostics_overlay;
+                            self.diagnostics_overlay.toggle();
                         }
                     });
                 });
@@ -978,7 +1008,7 @@ impl ArtemisApp {
                     });
                 }
             });
-        if self.diagnostics_overlay {
+        if self.diagnostics_overlay.is_visible() {
             self.performance_overlay(context);
         }
     }

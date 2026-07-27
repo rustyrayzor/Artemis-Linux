@@ -410,32 +410,7 @@ impl MediaRuntime {
             decoder: self.diagnostics.decoder,
             memory_path: self.diagnostics.memory_path,
         };
-        tracing::info!(
-            target: "artemis::media",
-            video_ingress_fps,
-            submitted_fps,
-            decoded_fps,
-            presented_fps,
-            decoder_queue_dropped = dropped,
-            callback_queue_dropped,
-            audio_ingress_pps,
-            video_mbps,
-            audio_kbps,
-            video_network_pps,
-            audio_network_pps,
-            video_packet_issues,
-            audio_packet_issues,
-            video_fec_recovered,
-            audio_fec_recovered,
-            video_media_elapsed_ms = ?video_clock.map(|clock| clock.media_elapsed),
-            video_wall_elapsed_ms = ?video_clock.map(|clock| clock.wall_elapsed),
-            video_clock_drift_ms = ?video_clock.map(|clock| clock.drift),
-            audio_media_elapsed_ms = ?audio_clock.map(|clock| clock.media_elapsed),
-            audio_wall_elapsed_ms = ?audio_clock.map(|clock| clock.wall_elapsed),
-            audio_clock_drift_ms = ?audio_clock.map(|clock| clock.drift),
-            audio_output_latency_ms = PIPEWIRE_AUDIO_LATENCY_MS,
-            "media pipeline telemetry"
-        );
+        trace_stream_diagnostics(self.diagnostics, submitted_fps, video_clock, audio_clock);
         self.last_video_report = current;
         self.last_ingress_report = ingress;
         self.last_network_report = network;
@@ -465,6 +440,40 @@ impl MediaRuntime {
         self.video.shutdown();
         self.audio.shutdown();
     }
+}
+
+fn trace_stream_diagnostics(
+    diagnostics: StreamDiagnostics,
+    submitted_fps: f64,
+    video_clock: Option<PlaybackClock>,
+    audio_clock: Option<PlaybackClock>,
+) {
+    tracing::info!(
+        target: "artemis::media",
+        video_ingress_fps = diagnostics.video_ingress_fps,
+        submitted_fps,
+        decoded_fps = diagnostics.decoded_fps,
+        presented_fps = diagnostics.presented_fps,
+        decoder_queue_dropped = diagnostics.decoder_queue_dropped,
+        callback_queue_dropped = diagnostics.callback_queue_dropped,
+        audio_ingress_pps = diagnostics.audio_ingress_pps,
+        video_mbps = diagnostics.video_mbps,
+        audio_kbps = diagnostics.audio_kbps,
+        video_network_pps = diagnostics.video_network_pps,
+        audio_network_pps = diagnostics.audio_network_pps,
+        video_packet_issues = diagnostics.video_packet_issues,
+        audio_packet_issues = diagnostics.audio_packet_issues,
+        video_fec_recovered = diagnostics.video_fec_recovered,
+        audio_fec_recovered = diagnostics.audio_fec_recovered,
+        video_media_elapsed_ms = ?video_clock.map(|clock| clock.media_elapsed),
+        video_wall_elapsed_ms = ?video_clock.map(|clock| clock.wall_elapsed),
+        video_clock_drift_ms = ?diagnostics.video_clock_drift_ms,
+        audio_media_elapsed_ms = ?audio_clock.map(|clock| clock.media_elapsed),
+        audio_wall_elapsed_ms = ?audio_clock.map(|clock| clock.wall_elapsed),
+        audio_clock_drift_ms = ?diagnostics.audio_clock_drift_ms,
+        audio_output_latency_ms = PIPEWIRE_AUDIO_LATENCY_MS,
+        "media pipeline telemetry"
+    );
 }
 
 struct VideoWorker {
