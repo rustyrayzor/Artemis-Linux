@@ -708,10 +708,10 @@ impl ArtemisApp {
                 .step_by(5.0)
                 .suffix(" Mbps")
                 .text("Bitrate");
-                if ui.add(bitrate_slider).changed()
-                    && let Some(bitrate) = StreamBitrate::from_mbps(bitrate_mbps)
-                {
-                    self.stream_bitrate = bitrate;
+                if ui.add(bitrate_slider).changed() {
+                    if let Some(bitrate) = StreamBitrate::from_mbps(bitrate_mbps) {
+                        self.stream_bitrate = bitrate;
+                    }
                 }
                 ui.label(
                     RichText::new(format!(
