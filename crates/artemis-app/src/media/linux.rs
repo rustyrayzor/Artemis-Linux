@@ -1,5 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::os::fd::AsRawFd;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -300,6 +302,7 @@ struct AudioPipeline {
     pipeline: gst::Pipeline,
     source: gst_app::AppSrc,
     timeline: AudioTimeline,
+    player: Option<PipeWirePlayer>,
     encoded_diagnostic: Option<BufWriter<File>>,
 }
 
@@ -308,8 +311,6 @@ struct AudioTimeline {
     next_pts: Option<gst::ClockTime>,
 }
 
-const AUDIO_TARGET_LATENCY_NS: u64 = 50_000_000;
-const AUDIO_MIN_LATENCY_NS: u64 = 20_000_000;
 const AUDIO_MAX_BUFFER_NS: u64 = 100_000_000;
 
 impl AudioTimeline {
@@ -334,16 +335,72 @@ impl AudioTimeline {
     }
 
     fn next(&mut self, start: gst::ClockTime) -> (gst::ClockTime, gst::ClockTime) {
-        let minimum_pts = start.saturating_add(gst::ClockTime::from_nseconds(AUDIO_MIN_LATENCY_NS));
-        let target_pts =
-            start.saturating_add(gst::ClockTime::from_nseconds(AUDIO_TARGET_LATENCY_NS));
-        let pts = self
-            .next_pts
-            .filter(|next_pts| *next_pts >= minimum_pts)
-            .unwrap_or(target_pts);
+        let pts = self.next_pts.unwrap_or(start);
         self.next_pts = Some(pts.saturating_add(self.frame_duration));
         (pts, self.frame_duration)
     }
+}
+
+struct PipeWirePlayer {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+impl PipeWirePlayer {
+    fn spawn(sample_rate: i32, channels: i32) -> Result<Self, String> {
+        let mut child = Command::new("pw-play")
+            .arg("--rate")
+            .arg(sample_rate.to_string())
+            .arg("--channels")
+            .arg(channels.to_string())
+            .args([
+                "--format",
+                "f32",
+                "--channel-map",
+                "stereo",
+                "--latency",
+                "100ms",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to start pw-play: {error}"))?;
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("pw-play did not expose its standard input".to_owned());
+        };
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+        })
+    }
+
+    fn input_fd(&self) -> Result<i32, String> {
+        self.stdin
+            .as_ref()
+            .map(|stdin| stdin.as_raw_fd())
+            .ok_or_else(|| "pw-play input is closed".to_owned())
+    }
+}
+
+impl Drop for PipeWirePlayer {
+    fn drop(&mut self) {
+        self.stdin.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AudioOutput {
+    PipeWirePlayer(i32),
+    PipeWireSink,
+    PulseSink,
 }
 
 impl AudioPipeline {
@@ -362,8 +419,15 @@ impl AudioPipeline {
             ));
         }
         let timeline = AudioTimeline::new(sample_rate, samples_per_frame)?;
-        let pipewire_available = gst::ElementFactory::find("pipewiresink").is_some();
-        let description = audio_pipeline_description(sample_rate, channels, pipewire_available);
+        let player = PipeWirePlayer::spawn(sample_rate, channels).ok();
+        let output = if let Some(player) = &player {
+            AudioOutput::PipeWirePlayer(player.input_fd()?)
+        } else if gst::ElementFactory::find("pipewiresink").is_some() {
+            AudioOutput::PipeWireSink
+        } else {
+            AudioOutput::PulseSink
+        };
+        let description = audio_pipeline_description(sample_rate, channels, output);
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
             .downcast::<gst::Pipeline>()
@@ -389,6 +453,7 @@ impl AudioPipeline {
             pipeline,
             source,
             timeline,
+            player,
             encoded_diagnostic,
         })
     }
@@ -425,14 +490,19 @@ impl AudioPipeline {
     }
 }
 
-fn audio_pipeline_description(sample_rate: i32, channels: i32, pipewire_available: bool) -> String {
-    // The reference host's Pulse compatibility path clips even low-amplitude test tones while
-    // native PipeWire preserves them. Prefer PipeWire and let its clock pace playback. Retain a
-    // clocked Pulse fallback for environments where the PipeWire GStreamer plugin is unavailable.
-    let sink = if pipewire_available {
-        "pipewiresink sync=true"
-    } else {
-        "pulsesink sync=true buffer-time=15000 latency-time=3750"
+fn audio_pipeline_description(sample_rate: i32, channels: i32, output: AudioOutput) -> String {
+    // PipeWire's own playback client provides a bounded, clocked device queue and applies
+    // backpressure through its stdin pipe. This avoids the long-running underruns observed when
+    // GStreamer scheduled live network packets directly on pipewiresink. Keep native PipeWire and
+    // clocked Pulse as dependency fallbacks for broader beta diagnostics.
+    let sink = match output {
+        AudioOutput::PipeWirePlayer(fd) => {
+            format!("fdsink fd={fd} sync=false async=false")
+        }
+        AudioOutput::PipeWireSink => "pipewiresink sync=true".to_owned(),
+        AudioOutput::PulseSink => {
+            "pulsesink sync=true buffer-time=15000 latency-time=3750".to_owned()
+        }
     };
     format!(
         "appsrc name=audio_src is-live=true format=time do-timestamp=false \
@@ -514,6 +584,7 @@ impl Drop for AudioPipeline {
     fn drop(&mut self) {
         let _ = self.source.end_of_stream();
         let _ = self.pipeline.set_state(gst::State::Null);
+        self.player.take();
         if let Some(diagnostic) = &mut self.encoded_diagnostic {
             let _ = diagnostic.flush();
         }
@@ -541,12 +612,13 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioTimeline, audio_pipeline_description, presentation_size, video_decoder_chain,
+        AudioOutput, AudioTimeline, audio_pipeline_description, presentation_size,
+        video_decoder_chain,
     };
     use gstreamer as gst;
 
     #[test]
-    fn opus_timeline_preserves_cadence_with_playback_look_ahead() {
+    fn opus_timeline_preserves_five_millisecond_cadence_for_batched_packets() {
         let mut timeline = AudioTimeline::new(48_000, 240).expect("valid Opus timing");
         let start = gst::ClockTime::from_mseconds(500);
 
@@ -555,25 +627,11 @@ mod tests {
         assert_eq!(
             timestamps,
             [
-                gst::ClockTime::from_mseconds(550),
-                gst::ClockTime::from_mseconds(555),
-                gst::ClockTime::from_mseconds(560),
-                gst::ClockTime::from_mseconds(565),
+                gst::ClockTime::from_mseconds(500),
+                gst::ClockTime::from_mseconds(505),
+                gst::ClockTime::from_mseconds(510),
+                gst::ClockTime::from_mseconds(515),
             ]
-        );
-    }
-
-    #[test]
-    fn opus_timeline_rebuffers_after_starvation() {
-        let mut timeline = AudioTimeline::new(48_000, 240).expect("valid Opus timing");
-
-        assert_eq!(
-            timeline.next(gst::ClockTime::from_mseconds(500)).0,
-            gst::ClockTime::from_mseconds(550)
-        );
-        assert_eq!(
-            timeline.next(gst::ClockTime::from_mseconds(700)).0,
-            gst::ClockTime::from_mseconds(750)
         );
     }
 
@@ -584,22 +642,34 @@ mod tests {
     }
 
     #[test]
-    fn native_pipewire_sink_owns_audio_pacing_without_an_artificial_reservoir() {
-        let description = audio_pipeline_description(48_000, 2, true);
+    fn pipewire_player_owns_audio_pacing_with_a_bounded_input() {
+        let description = audio_pipeline_description(48_000, 2, AudioOutput::PipeWirePlayer(17));
 
         assert!(description.contains("audio/x-raw,format=F32LE,rate=48000,channels=2"));
         assert!(description.contains("block=true max-time=100000000"));
         assert!(description.contains(
             "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 ! \
-             pipewiresink sync=true"
+             fdsink fd=17 sync=false async=false"
         ));
         assert!(!description.contains("min-threshold-time"));
         assert!(!description.contains("pulsesink"));
+        assert!(!description.contains("pipewiresink"));
+    }
+
+    #[test]
+    fn native_pipewire_sink_is_retained_as_a_player_fallback() {
+        let description = audio_pipeline_description(48_000, 2, AudioOutput::PipeWireSink);
+
+        assert!(description.contains(
+            "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 ! \
+             pipewiresink sync=true"
+        ));
+        assert!(!description.contains("fdsink"));
     }
 
     #[test]
     fn clocked_pulse_sink_is_retained_as_a_plugin_fallback() {
-        let description = audio_pipeline_description(48_000, 2, false);
+        let description = audio_pipeline_description(48_000, 2, AudioOutput::PulseSink);
 
         assert!(description.contains(
             "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 ! \
