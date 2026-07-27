@@ -58,5 +58,22 @@ RUST_LOG=artemis=debug ./target/release/artemis-linux
 9. Disconnect and verify the local stream exits without hanging.
 10. Reconnect with Resume, then use End host app and verify `/cancel`.
 
+For unattended beta diagnostics, the same launch path can be exercised without
+changing normal UI startup:
+
+```bash
+ARTEMIS_AUTOSTART_HOST=192.168.100.128 \
+ARTEMIS_AUTOSTART_APP=Desktop \
+ARTEMIS_AUTOSTART_PRESET=4K60 \
+ARTEMIS_AUTOSTART_BITRATE_MBPS=40 \
+ARTEMIS_AUTOSTART_FULLSCREEN=true \
+./artemis-linux
+```
+
+Both the host and application variables are required. The preset accepts
+`1080p60`, `1440p60`, `4K60`, or `2160p60`; bitrate remains constrained to the
+same 10–300 Mbps range as the UI. These variables are intended for repeatable
+reference-host diagnostics and are ignored when the required pair is absent.
+
 Capture `RUST_LOG=artemis=debug` output for any failure. Never include private
 keys or certificate contents in a diagnostic bundle.

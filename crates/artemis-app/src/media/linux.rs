@@ -541,6 +541,22 @@ impl VideoPipeline {
     ) -> Result<Self, String> {
         let has_va_decoder = gst::ElementFactory::find("vah264dec").is_some();
         let use_gl_interop = has_va_decoder && gl_interop.is_some();
+        tracing::info!(
+            target: "artemis::media",
+            decoder = if has_va_decoder {
+                "vah264dec"
+            } else {
+                "avdec_h264"
+            },
+            memory_path = if use_gl_interop {
+                "DMABuf-to-GLMemory"
+            } else {
+                "system-memory"
+            },
+            width,
+            height,
+            "configuring video pipeline"
+        );
         let description = video_pipeline_description(width, height, has_va_decoder, use_gl_interop);
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?

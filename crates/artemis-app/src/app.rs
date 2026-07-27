@@ -16,6 +16,11 @@ use crate::media::{DecodedFrame, GlInteropContext, MediaRuntime};
 use crate::video_texture::StreamTexture;
 
 const DEFAULT_HTTP_PORT: u16 = 47_989;
+const AUTOSTART_HOST_ENV: &str = "ARTEMIS_AUTOSTART_HOST";
+const AUTOSTART_APP_ENV: &str = "ARTEMIS_AUTOSTART_APP";
+const AUTOSTART_PRESET_ENV: &str = "ARTEMIS_AUTOSTART_PRESET";
+const AUTOSTART_BITRATE_ENV: &str = "ARTEMIS_AUTOSTART_BITRATE_MBPS";
+const AUTOSTART_FULLSCREEN_ENV: &str = "ARTEMIS_AUTOSTART_FULLSCREEN";
 
 pub struct ArtemisApp {
     identity: ClientIdentity,
@@ -39,6 +44,8 @@ pub struct ArtemisApp {
     stream_preset: StreamPreset,
     stream_bitrate: StreamBitrate,
     fullscreen: bool,
+    pending_autostart: Option<AutostartRequest>,
+    fullscreen_on_connect: bool,
 }
 
 struct ActiveStream {
@@ -51,6 +58,15 @@ struct ActiveStream {
     app_title: String,
     profile_label: String,
     connected: bool,
+}
+
+#[derive(Debug)]
+struct AutostartRequest {
+    address: HostAddress,
+    application_title: String,
+    preset: StreamPreset,
+    bitrate: StreamBitrate,
+    fullscreen: bool,
 }
 
 enum TaskMessage {
@@ -85,7 +101,20 @@ impl ArtemisApp {
         configure_style(&context.egui_ctx);
         let paired_hosts = store.load().unwrap_or_default();
         let (tasks, task_results) = unbounded();
-        let stream_preset = StreamPreset::default();
+        let (pending_autostart, autostart_error) = match autostart_from_environment() {
+            Ok(request) => (request, None),
+            Err(error) => {
+                tracing::warn!(%error, "ignoring invalid diagnostic autostart configuration");
+                (None, Some(error))
+            }
+        };
+        let stream_preset = pending_autostart
+            .as_ref()
+            .map_or_else(StreamPreset::default, |request| request.preset);
+        let stream_bitrate = pending_autostart.as_ref().map_or_else(
+            || stream_preset.default_bitrate(),
+            |request| request.bitrate,
+        );
         let gl_interop = match GlInteropContext::new(context) {
             Ok(Some(context)) => {
                 tracing::info!(
@@ -122,7 +151,7 @@ impl ArtemisApp {
             manual_host: String::new(),
             passphrase: String::new(),
             pairing_pin: None,
-            status: "Ready".to_owned(),
+            status: autostart_error.unwrap_or_else(|| "Ready".to_owned()),
             busy: false,
             tasks,
             task_results,
@@ -130,10 +159,24 @@ impl ArtemisApp {
             gl_interop,
             texture: None,
             stream_preset,
-            stream_bitrate: stream_preset.default_bitrate(),
+            stream_bitrate,
             fullscreen: false,
+            pending_autostart,
+            fullscreen_on_connect: false,
         };
-        app.start_discovery();
+        if let Some(request) = &app.pending_autostart {
+            tracing::info!(
+                host = %request.address.host,
+                application = %request.application_title,
+                preset = request.preset.label(),
+                bitrate_mbps = request.bitrate.mbps(),
+                fullscreen = request.fullscreen,
+                "diagnostic autostart is configured"
+            );
+            app.inspect(request.address.clone());
+        } else {
+            app.start_discovery();
+        }
         app
     }
 
@@ -392,6 +435,30 @@ impl ArtemisApp {
                             );
                             self.selected_record = Some(record);
                             self.applications = applications;
+                            if let Some(request) = self.pending_autostart.take() {
+                                let application = self
+                                    .applications
+                                    .iter()
+                                    .find(|application| {
+                                        application
+                                            .title
+                                            .eq_ignore_ascii_case(&request.application_title)
+                                    })
+                                    .cloned();
+                                if let Some(application) = application {
+                                    tracing::info!(
+                                        application = %application.title,
+                                        "launching diagnostic autostart application"
+                                    );
+                                    self.fullscreen_on_connect = request.fullscreen;
+                                    self.launch(application);
+                                } else {
+                                    self.status = format!(
+                                        "Autostart application '{}' was not found.",
+                                        request.application_title
+                                    );
+                                }
+                            }
                         }
                         Err(error) => self.status = error,
                     }
@@ -437,6 +504,10 @@ impl ArtemisApp {
                                         profile_label,
                                         connected: false,
                                     });
+                                    if self.fullscreen_on_connect {
+                                        self.set_fullscreen(context, true);
+                                        self.fullscreen_on_connect = false;
+                                    }
                                     context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
                                         egui::CursorGrab::Locked,
                                     ));
@@ -945,9 +1016,86 @@ fn parse_manual_host(value: &str) -> std::result::Result<HostAddress, String> {
     Ok(HostAddress::new(value, DEFAULT_HTTP_PORT))
 }
 
+fn autostart_from_environment() -> std::result::Result<Option<AutostartRequest>, String> {
+    autostart_from_values(
+        std::env::var(AUTOSTART_HOST_ENV).ok().as_deref(),
+        std::env::var(AUTOSTART_APP_ENV).ok().as_deref(),
+        std::env::var(AUTOSTART_PRESET_ENV).ok().as_deref(),
+        std::env::var(AUTOSTART_BITRATE_ENV).ok().as_deref(),
+        std::env::var(AUTOSTART_FULLSCREEN_ENV).ok().as_deref(),
+    )
+}
+
+fn autostart_from_values(
+    host: Option<&str>,
+    application: Option<&str>,
+    preset: Option<&str>,
+    bitrate_mbps: Option<&str>,
+    fullscreen: Option<&str>,
+) -> std::result::Result<Option<AutostartRequest>, String> {
+    let (Some(host), Some(application)) = (host, application) else {
+        if host.is_some() || application.is_some() {
+            return Err(format!(
+                "{AUTOSTART_HOST_ENV} and {AUTOSTART_APP_ENV} must be set together"
+            ));
+        }
+        return Ok(None);
+    };
+    let address = parse_manual_host(host)?;
+    let application_title = application.trim();
+    if application_title.is_empty() {
+        return Err(format!("{AUTOSTART_APP_ENV} cannot be empty"));
+    }
+    let preset = parse_autostart_preset(preset.unwrap_or("1080p60"))?;
+    let bitrate = match bitrate_mbps {
+        Some(value) => {
+            let mbps = value
+                .parse::<i32>()
+                .map_err(|_| format!("{AUTOSTART_BITRATE_ENV} must be a whole number"))?;
+            StreamBitrate::from_mbps(mbps).ok_or_else(|| {
+                format!(
+                    "{AUTOSTART_BITRATE_ENV} must be between {} and {}",
+                    StreamBitrate::MIN_MBPS,
+                    StreamBitrate::MAX_MBPS
+                )
+            })?
+        }
+        None => preset.default_bitrate(),
+    };
+    let fullscreen = match fullscreen.unwrap_or("false").to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => true,
+        "0" | "false" | "no" => false,
+        _ => {
+            return Err(format!(
+                "{AUTOSTART_FULLSCREEN_ENV} must be true, false, 1, 0, yes, or no"
+            ));
+        }
+    };
+    Ok(Some(AutostartRequest {
+        address,
+        application_title: application_title.to_owned(),
+        preset,
+        bitrate,
+        fullscreen,
+    }))
+}
+
+fn parse_autostart_preset(value: &str) -> std::result::Result<StreamPreset, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1080p60" => Ok(StreamPreset::FullHd60),
+        "1440p60" => Ok(StreamPreset::QuadHd60),
+        "4k60" | "2160p60" => Ok(StreamPreset::UltraHd60),
+        _ => Err(format!(
+            "{AUTOSTART_PRESET_ENV} must be 1080p60, 1440p60, 4K60, or 2160p60"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_manual_host;
+    use artemis_core::StreamPreset;
+
+    use super::{AUTOSTART_APP_ENV, autostart_from_values, parse_manual_host};
 
     #[test]
     fn parses_default_and_explicit_ports() {
@@ -961,5 +1109,32 @@ mod tests {
                 .http_port,
             48_000
         );
+    }
+
+    #[test]
+    fn parses_diagnostic_autostart_profile() {
+        let request = autostart_from_values(
+            Some("192.168.100.128"),
+            Some("Desktop"),
+            Some("4K60"),
+            Some("40"),
+            Some("true"),
+        )
+        .expect("valid configuration")
+        .expect("autostart request");
+
+        assert_eq!(request.address.host, "192.168.100.128");
+        assert_eq!(request.application_title, "Desktop");
+        assert_eq!(request.preset, StreamPreset::UltraHd60);
+        assert_eq!(request.bitrate.mbps(), 40);
+        assert!(request.fullscreen);
+    }
+
+    #[test]
+    fn requires_both_autostart_target_values() {
+        let error = autostart_from_values(Some("192.168.100.128"), None, Some("4K60"), None, None)
+            .expect_err("incomplete configuration");
+
+        assert!(error.contains(AUTOSTART_APP_ENV));
     }
 }
