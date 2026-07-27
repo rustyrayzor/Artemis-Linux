@@ -8,11 +8,12 @@ use artemis_core::{
 };
 use artemis_moonlight::{ConnectionQuality, EventReceiver, Session, StreamConfig, StreamEvent};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use eframe::egui::{self, Color32, RichText, TextureHandle, TextureOptions};
+use eframe::egui::{self, Color32, RichText};
+use eframe::glow::{self, HasContext};
 
 use crate::controller::ControllerManager;
 use crate::input::InputRouter;
-use crate::media::MediaRuntime;
+use crate::media::{DecodedFrame, MediaRuntime};
 
 const DEFAULT_HTTP_PORT: u16 = 47_989;
 
@@ -33,10 +34,24 @@ pub struct ArtemisApp {
     tasks: Sender<TaskMessage>,
     task_results: Receiver<TaskMessage>,
     active_stream: Option<ActiveStream>,
-    texture: Option<TextureHandle>,
+    texture: Option<StreamTexture>,
     stream_preset: StreamPreset,
     stream_bitrate: StreamBitrate,
     fullscreen: bool,
+}
+
+struct StreamTexture {
+    id: egui::TextureId,
+    native: glow::Texture,
+    size: [usize; 2],
+}
+
+impl StreamTexture {
+    fn size_vec2(&self) -> egui::Vec2 {
+        let width = u16::try_from(self.size[0]).unwrap_or(u16::MAX);
+        let height = u16::try_from(self.size[1]).unwrap_or(u16::MAX);
+        egui::vec2(f32::from(width), f32::from(height))
+    }
 }
 
 struct ActiveStream {
@@ -435,7 +450,7 @@ impl ArtemisApp {
         }
     }
 
-    fn pump_stream(&mut self, context: &egui::Context) {
+    fn pump_stream(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
         let mut events = Vec::new();
         if let Some(active) = &self.active_stream {
             while let Ok(event) = active.events.try_recv() {
@@ -491,16 +506,19 @@ impl ArtemisApp {
             if active.connected {
                 active.input.forward(context, &mut active.session);
             }
-            if let Some(frame) = active.media.try_frame() {
-                let image = frame.image;
-                if let Some(texture) = &mut self.texture {
-                    texture.set(image, TextureOptions::LINEAR);
-                } else {
-                    self.texture =
-                        Some(context.load_texture("artemis-stream", image, TextureOptions::LINEAR));
-                }
+        }
+        let decoded_frame = self
+            .active_stream
+            .as_ref()
+            .and_then(|active| active.media.try_frame());
+        if let Some(decoded_frame) = decoded_frame {
+            if let Err(error) = self.upload_stream_frame(frame, &decoded_frame) {
+                self.status = error;
+            } else if let Some(active) = &self.active_stream {
                 active.media.record_presented();
             }
+        }
+        if let Some(active) = &mut self.active_stream {
             active.media.report_video_stats();
             if let Some(error) = active.media.poll_error() {
                 self.status = error;
@@ -515,6 +533,36 @@ impl ArtemisApp {
                 format!("The stream terminated with code {error}.")
             };
         }
+    }
+
+    #[allow(unsafe_code)]
+    fn upload_stream_frame(
+        &mut self,
+        frame: &mut eframe::Frame,
+        decoded: &DecodedFrame,
+    ) -> Result<(), String> {
+        let gl = frame
+            .gl()
+            .cloned()
+            .ok_or_else(|| "the OpenGL renderer is unavailable".to_owned())?;
+        let size = [decoded.width, decoded.height];
+        if let Some(texture) = &mut self.texture {
+            let allocate = texture.size != size;
+            upload_rgba(&gl, texture.native, decoded, allocate)?;
+            texture.size = size;
+            return Ok(());
+        }
+
+        // SAFETY: `gl` is the current eframe rendering context on the UI thread.
+        let native = unsafe { gl.create_texture() }.map_err(|error| error.to_string())?;
+        if let Err(error) = upload_rgba(&gl, native, decoded, true) {
+            // SAFETY: This texture was just created in the current context and was not registered.
+            unsafe { gl.delete_texture(native) };
+            return Err(error);
+        }
+        let id = frame.register_native_glow_texture(native);
+        self.texture = Some(StreamTexture { id, native, size });
+        Ok(())
     }
 
     fn handle_stream_shortcuts(&mut self, context: &egui::Context) {
@@ -545,7 +593,6 @@ impl ArtemisApp {
         active.controller.disconnect(&mut active.session);
         active.media.shutdown();
         active.session.stop();
-        self.texture = None;
         self.set_fullscreen(context, false);
         context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
         context.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
@@ -800,7 +847,7 @@ impl ArtemisApp {
                         .max(0.01);
                     let size = source * scale;
                     ui.centered_and_justified(|ui| {
-                        ui.image((texture.id(), size));
+                        ui.image((texture.id, size));
                     });
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -811,11 +858,75 @@ impl ArtemisApp {
     }
 }
 
+#[allow(unsafe_code)]
+fn upload_rgba(
+    gl: &glow::Context,
+    texture: glow::Texture,
+    decoded: &DecodedFrame,
+    allocate: bool,
+) -> Result<(), String> {
+    let expected_bytes = decoded
+        .width
+        .checked_mul(decoded.height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "decoded video dimensions overflowed".to_owned())?;
+    if decoded.rgba.len() != expected_bytes {
+        return Err("decoded video buffer has an invalid length".to_owned());
+    }
+    let width =
+        i32::try_from(decoded.width).map_err(|_| "decoded video width is too large".to_owned())?;
+    let height = i32::try_from(decoded.height)
+        .map_err(|_| "decoded video height is too large".to_owned())?;
+    let linear = i32::try_from(glow::LINEAR).map_err(|_| "invalid GL filter value".to_owned())?;
+    let clamp =
+        i32::try_from(glow::CLAMP_TO_EDGE).map_err(|_| "invalid GL wrap value".to_owned())?;
+    let internal_format =
+        i32::try_from(glow::SRGB8_ALPHA8).map_err(|_| "invalid GL format value".to_owned())?;
+
+    // SAFETY: The texture belongs to this current GL context. The source byte slice is valid for
+    // the duration of the synchronous upload and its validated length matches the RGBA dimensions.
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        if allocate {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, linear);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, linear);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, clamp);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, clamp);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                internal_format,
+                width,
+                height,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&decoded.rgba)),
+            );
+        } else {
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                width,
+                height,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&decoded.rgba)),
+            );
+        }
+        gl.bind_texture(glow::TEXTURE_2D, None);
+    }
+    Ok(())
+}
+
 impl eframe::App for ArtemisApp {
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
         self.drain_tasks(context);
         self.handle_stream_shortcuts(context);
-        self.pump_stream(context);
+        self.pump_stream(context, frame);
 
         if !self.fullscreen {
             egui::TopBottomPanel::bottom("status")

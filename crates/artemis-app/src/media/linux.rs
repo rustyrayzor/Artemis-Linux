@@ -10,7 +10,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use eframe::egui;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -18,7 +17,9 @@ use gstreamer_app as gst_app;
 use artemis_moonlight::{AudioEventReceiver, StreamEvent};
 
 pub struct DecodedFrame {
-    pub image: egui::ColorImage,
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -218,13 +219,9 @@ impl VideoPipeline {
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                     let frame = DecodedFrame {
-                        image: egui::ColorImage::from_rgba_unmultiplied(
-                            [
-                                usize::try_from(width).map_err(|_| gst::FlowError::Error)?,
-                                usize::try_from(height).map_err(|_| gst::FlowError::Error)?,
-                            ],
-                            map.as_slice(),
-                        ),
+                        width: usize::try_from(width).map_err(|_| gst::FlowError::Error)?,
+                        height: usize::try_from(height).map_err(|_| gst::FlowError::Error)?,
+                        rgba: map.as_slice().to_vec(),
                     };
                     let _ = frames.try_send(frame);
                     Ok(gst::FlowSuccess::Ok)

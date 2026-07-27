@@ -1,9 +1,9 @@
-use eframe::egui;
-
 use artemis_moonlight::{AudioEventReceiver, StreamEvent};
 
 pub struct DecodedFrame {
-    pub image: egui::ColorImage,
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
 }
 
 pub struct MediaRuntime;
