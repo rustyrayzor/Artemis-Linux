@@ -425,7 +425,7 @@ impl VideoWorker {
                     &error_sender,
                     &frames,
                     &video_counters,
-                    &gl_interop,
+                    gl_interop.as_ref(),
                 );
             })
             .map_err(|error| error.to_string())?;
@@ -461,7 +461,7 @@ fn run_video_worker(
     errors: &Sender<String>,
     frames: &crossbeam_channel::Sender<DecodedFrame>,
     video_counters: &Arc<VideoCounters>,
-    gl_interop: &Option<GlInteropContext>,
+    gl_interop: Option<&GlInteropContext>,
 ) {
     let mut video = None;
     loop {
@@ -486,7 +486,7 @@ fn run_video_worker(
                         fps,
                         frames.clone(),
                         Arc::clone(video_counters),
-                        gl_interop.clone(),
+                        gl_interop.cloned(),
                     )
                 };
                 match result {
