@@ -228,12 +228,12 @@ impl MediaRuntime {
             audio_ingress_pps,
             video_network_pps,
             audio_network_pps,
-            video_media_elapsed_ms = ?video_clock.map(|clock| clock.media_elapsed_ms),
-            video_wall_elapsed_ms = ?video_clock.map(|clock| clock.wall_elapsed_ms),
-            video_clock_drift_ms = ?video_clock.map(|clock| clock.drift_ms),
-            audio_media_elapsed_ms = ?audio_clock.map(|clock| clock.media_elapsed_ms),
-            audio_wall_elapsed_ms = ?audio_clock.map(|clock| clock.wall_elapsed_ms),
-            audio_clock_drift_ms = ?audio_clock.map(|clock| clock.drift_ms),
+            video_media_elapsed_ms = ?video_clock.map(|clock| clock.media_elapsed),
+            video_wall_elapsed_ms = ?video_clock.map(|clock| clock.wall_elapsed),
+            video_clock_drift_ms = ?video_clock.map(|clock| clock.drift),
+            audio_media_elapsed_ms = ?audio_clock.map(|clock| clock.media_elapsed),
+            audio_wall_elapsed_ms = ?audio_clock.map(|clock| clock.wall_elapsed),
+            audio_clock_drift_ms = ?audio_clock.map(|clock| clock.drift),
             audio_output_latency_ms = PIPEWIRE_AUDIO_LATENCY_MS,
             "media pipeline telemetry"
         );
@@ -514,18 +514,18 @@ impl VideoPipeline {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PlaybackClock {
-    media_elapsed_ms: u64,
-    wall_elapsed_ms: u64,
-    drift_ms: i64,
+    media_elapsed: u64,
+    wall_elapsed: u64,
+    drift: i64,
 }
 
 impl PlaybackClock {
     fn new(media_elapsed_us: u64, wall_elapsed: Duration) -> Self {
         let wall_elapsed_us = duration_micros(wall_elapsed);
         Self {
-            media_elapsed_ms: media_elapsed_us / 1_000,
-            wall_elapsed_ms: wall_elapsed_us / 1_000,
-            drift_ms: signed_difference_millis(media_elapsed_us, wall_elapsed_us),
+            media_elapsed: media_elapsed_us / 1_000,
+            wall_elapsed: wall_elapsed_us / 1_000,
+            drift: signed_difference_millis(media_elapsed_us, wall_elapsed_us),
         }
     }
 }
@@ -543,9 +543,9 @@ fn audio_clock(stats: AudioStats) -> Option<PlaybackClock> {
         .last_output_elapsed_us
         .saturating_sub(stats.first_output_elapsed_us);
     Some(PlaybackClock {
-        media_elapsed_ms: media_elapsed_us / 1_000,
-        wall_elapsed_ms: wall_elapsed_us / 1_000,
-        drift_ms: signed_difference_millis(media_elapsed_us, wall_elapsed_us),
+        media_elapsed: media_elapsed_us / 1_000,
+        wall_elapsed: wall_elapsed_us / 1_000,
+        drift: signed_difference_millis(media_elapsed_us, wall_elapsed_us),
     })
 }
 
@@ -554,16 +554,16 @@ fn duration_micros(duration: Duration) -> u64 {
 }
 
 fn signed_difference_millis(left_us: u64, right_us: u64) -> i64 {
-    let (positive, magnitude_us) = if left_us >= right_us {
+    let (positive, difference_us) = if left_us >= right_us {
         (true, left_us - right_us)
     } else {
         (false, right_us - left_us)
     };
-    let magnitude_ms = i64::try_from(magnitude_us / 1_000).unwrap_or(i64::MAX);
+    let difference_ms = i64::try_from(difference_us / 1_000).unwrap_or(i64::MAX);
     if positive {
-        magnitude_ms
+        difference_ms
     } else {
-        -magnitude_ms
+        -difference_ms
     }
 }
 
@@ -712,8 +712,10 @@ fn run_audio_worker(
                     coupled_streams,
                     samples_per_frame,
                     &mapping,
-                    Arc::clone(audio_counters),
-                    clock_origin,
+                    AudioTelemetry {
+                        counters: Arc::clone(audio_counters),
+                        origin: clock_origin,
+                    },
                 ) {
                     Ok(pipeline) => audio = Some(pipeline),
                     Err(error) => {
@@ -751,8 +753,13 @@ struct AudioPipeline {
     timeline: AudioTimeline,
     player: Option<PipeWirePlayer>,
     encoded_diagnostic: Option<BufWriter<File>>,
-    audio_counters: Arc<AudioCounters>,
-    clock_origin: Instant,
+    telemetry: AudioTelemetry,
+}
+
+#[derive(Clone)]
+struct AudioTelemetry {
+    counters: Arc<AudioCounters>,
+    origin: Instant,
 }
 
 struct AudioTimeline {
@@ -856,8 +863,7 @@ impl AudioPipeline {
         coupled_streams: i32,
         samples_per_frame: i32,
         mapping: &[u8],
-        audio_counters: Arc<AudioCounters>,
-        clock_origin: Instant,
+        telemetry: AudioTelemetry,
     ) -> Result<Self, String> {
         if channels != 2 || streams != 1 || coupled_streams != 1 || mapping != [0, 1] {
             return Err(format!(
@@ -866,7 +872,9 @@ impl AudioPipeline {
             ));
         }
         let timeline = AudioTimeline::new(sample_rate, samples_per_frame)?;
-        audio_counters.reset(timeline.frame_duration.nseconds() / 1_000);
+        telemetry
+            .counters
+            .reset(timeline.frame_duration.nseconds() / 1_000);
         let player = PipeWirePlayer::spawn(sample_rate, channels).ok();
         let output = if let Some(player) = &player {
             AudioOutput::PipeWirePlayer(player.input_fd()?)
@@ -903,8 +911,7 @@ impl AudioPipeline {
             timeline,
             player,
             encoded_diagnostic,
-            audio_counters,
-            clock_origin,
+            telemetry,
         })
     }
 
@@ -924,8 +931,9 @@ impl AudioPipeline {
         let (pts, duration) = self.timeline.next(start);
         if packet.is_empty() {
             if self.source.send_event(gst::event::Gap::new(pts, duration)) {
-                self.audio_counters
-                    .record_output(self.clock_origin, duration.nseconds() / 1_000);
+                self.telemetry
+                    .counters
+                    .record_output(self.telemetry.origin, duration.nseconds() / 1_000);
                 return Ok(());
             }
             return Err("GStreamer rejected an Opus packet-loss gap".to_owned());
@@ -938,8 +946,9 @@ impl AudioPipeline {
         self.source
             .push_buffer(buffer)
             .map(|_| {
-                self.audio_counters
-                    .record_output(self.clock_origin, duration.nseconds() / 1_000);
+                self.telemetry
+                    .counters
+                    .record_output(self.telemetry.origin, duration.nseconds() / 1_000);
             })
             .map_err(|error| error.to_string())
     }
@@ -1103,9 +1112,9 @@ mod tests {
     fn playback_clock_reports_media_drift_against_wall_time() {
         let clock = PlaybackClock::new(10_050_000, Duration::from_secs(10));
 
-        assert_eq!(clock.media_elapsed_ms, 10_050);
-        assert_eq!(clock.wall_elapsed_ms, 10_000);
-        assert_eq!(clock.drift_ms, 50);
+        assert_eq!(clock.media_elapsed, 10_050);
+        assert_eq!(clock.wall_elapsed, 10_000);
+        assert_eq!(clock.drift, 50);
     }
 
     #[test]
@@ -1119,9 +1128,9 @@ mod tests {
         })
         .expect("enough audio samples");
 
-        assert_eq!(clock.media_elapsed_ms, 1_000);
-        assert_eq!(clock.wall_elapsed_ms, 1_000);
-        assert_eq!(clock.drift_ms, 0);
+        assert_eq!(clock.media_elapsed, 1_000);
+        assert_eq!(clock.wall_elapsed, 1_000);
+        assert_eq!(clock.drift, 0);
     }
 
     #[test]
