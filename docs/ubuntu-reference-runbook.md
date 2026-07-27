@@ -50,7 +50,8 @@ RUST_LOG=artemis=debug ./target/release/artemis-linux
 6. Confirm the local presentation remains scaled to fit the Artemis window at
    each resolution.
 7. Enter fullscreen using the on-screen control, exit with Escape, then toggle
-   fullscreen on and off with F11.
+   fullscreen on and off with F11. Confirm the video is edge-to-edge with no
+   desktop panel, window decoration, application controls, or status border.
 8. Confirm keyboard press/release, relative mouse movement/buttons/wheel, and
    one connected controller.
 9. Disconnect and verify the local stream exits without hanging.

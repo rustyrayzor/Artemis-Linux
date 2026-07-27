@@ -727,31 +727,28 @@ impl ArtemisApp {
     }
 
     fn stream_ui(&mut self, context: &egui::Context) {
-        egui::TopBottomPanel::top("stream_controls").show(context, |ui| {
-            ui.horizontal(|ui| {
-                let title = self.active_stream.as_ref().map_or_else(
-                    || "Stream".to_owned(),
-                    |active| format!("{} · {}", active.app_title, active.profile_label),
-                );
-                ui.label(RichText::new(title).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("End host app").clicked() {
-                        self.disconnect(context, true);
-                    }
-                    if ui.button("Disconnect").clicked() {
-                        self.disconnect(context, false);
-                    }
-                    let fullscreen_label = if self.fullscreen {
-                        "Exit fullscreen"
-                    } else {
-                        "Fullscreen"
-                    };
-                    if ui.button(fullscreen_label).clicked() {
-                        self.set_fullscreen(context, !self.fullscreen);
-                    }
+        if !self.fullscreen {
+            egui::TopBottomPanel::top("stream_controls").show(context, |ui| {
+                ui.horizontal(|ui| {
+                    let title = self.active_stream.as_ref().map_or_else(
+                        || "Stream".to_owned(),
+                        |active| format!("{} · {}", active.app_title, active.profile_label),
+                    );
+                    ui.label(RichText::new(title).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("End host app").clicked() {
+                            self.disconnect(context, true);
+                        }
+                        if ui.button("Disconnect").clicked() {
+                            self.disconnect(context, false);
+                        }
+                        if ui.button("Fullscreen").clicked() {
+                            self.set_fullscreen(context, true);
+                        }
+                    });
                 });
             });
-        });
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::BLACK))
             .show(context, |ui| {
@@ -780,20 +777,22 @@ impl eframe::App for ArtemisApp {
         self.handle_stream_shortcuts(context);
         self.pump_stream(context);
 
-        egui::TopBottomPanel::bottom("status")
-            .exact_height(30.0)
-            .show(context, |ui| {
-                ui.horizontal_centered(|ui| {
-                    if self.busy {
-                        ui.spinner();
-                    }
-                    ui.label(
-                        RichText::new(&self.status)
-                            .small()
-                            .color(Color32::from_rgb(70, 70, 68)),
-                    );
+        if !self.fullscreen {
+            egui::TopBottomPanel::bottom("status")
+                .exact_height(30.0)
+                .show(context, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        if self.busy {
+                            ui.spinner();
+                        }
+                        ui.label(
+                            RichText::new(&self.status)
+                                .small()
+                                .color(Color32::from_rgb(70, 70, 68)),
+                        );
+                    });
                 });
-            });
+        }
 
         if self.active_stream.is_some() {
             self.stream_ui(context);

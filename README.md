@@ -13,8 +13,8 @@ The first supported vertical slice includes:
 - selectable H.264 1080p60, 1440p60, and 4K60 SDR video through GStreamer, with
   stereo Opus decoded through GStreamer and played through PipeWire;
 - keyboard, relative mouse, wheel, and one game controller;
-- true fullscreen presentation with an on-screen control, F11 toggle, and
-  Escape-to-exit behavior;
+- borderless, edge-to-edge fullscreen presentation with an on-screen control,
+  F11 toggle, and Escape-to-exit behavior;
 - disconnect, host application cancellation, and RAII cleanup.
 
 The Rust control plane owns discovery, pairing, XML/HTTP, launch, and lifecycle.
