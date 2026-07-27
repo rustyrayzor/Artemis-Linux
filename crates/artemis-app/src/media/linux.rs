@@ -821,7 +821,13 @@ fn run_audio_worker(
     audio_counters: &Arc<AudioCounters>,
     clock_origin: Instant,
 ) {
+    let telemetry = AudioTelemetry {
+        counters: Arc::clone(audio_counters),
+        origin: clock_origin,
+    };
+    let mut configuration = None;
     let mut audio = None;
+    let mut retry_at = None;
     loop {
         if stop.try_recv().is_ok() {
             break;
@@ -835,32 +841,51 @@ fn run_audio_worker(
                 samples_per_frame,
                 mapping,
             }) => {
-                match AudioPipeline::new(
+                let next_configuration = AudioConfiguration {
                     sample_rate,
                     channels,
                     streams,
                     coupled_streams,
                     samples_per_frame,
-                    &mapping,
-                    AudioTelemetry {
-                        counters: Arc::clone(audio_counters),
-                        origin: clock_origin,
-                    },
-                ) {
-                    Ok(pipeline) => audio = Some(pipeline),
+                    mapping,
+                };
+                match next_configuration.create_pipeline(telemetry.clone()) {
+                    Ok(pipeline) => {
+                        audio = Some(pipeline);
+                        retry_at = None;
+                    }
                     Err(error) => {
                         audio = None;
+                        retry_at = Some(Instant::now() + AUDIO_RETRY_DELAY);
                         let _ = errors.send(error);
                     }
                 }
+                configuration = Some(next_configuration);
             }
             Ok(StreamEvent::AudioPacket(packet)) => {
+                if audio.is_none() && retry_at.is_none_or(|deadline| Instant::now() >= deadline) {
+                    let Some(configuration) = &configuration else {
+                        continue;
+                    };
+                    match configuration.create_pipeline(telemetry.clone()) {
+                        Ok(pipeline) => {
+                            audio = Some(pipeline);
+                            retry_at = None;
+                        }
+                        Err(error) => {
+                            retry_at = Some(Instant::now() + AUDIO_RETRY_DELAY);
+                            let _ = errors
+                                .send(format!("audio output restart failed; retrying: {error}"));
+                        }
+                    }
+                }
                 let Some(pipeline) = &mut audio else {
                     continue;
                 };
                 if let Err(error) = pipeline.push(packet) {
                     audio = None;
-                    let _ = errors.send(error);
+                    retry_at = Some(Instant::now() + AUDIO_RETRY_DELAY);
+                    let _ = errors.send(format!("audio output stopped; restarting: {error}"));
                 }
             }
             Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -872,8 +897,33 @@ fn run_audio_worker(
             .and_then(|pipeline| pipeline_error(&pipeline.pipeline))
         {
             audio = None;
-            let _ = errors.send(error);
+            retry_at = Some(Instant::now() + AUDIO_RETRY_DELAY);
+            let _ = errors.send(format!("audio pipeline stopped; restarting: {error}"));
         }
+    }
+}
+
+#[derive(Clone)]
+struct AudioConfiguration {
+    sample_rate: i32,
+    channels: i32,
+    streams: i32,
+    coupled_streams: i32,
+    samples_per_frame: i32,
+    mapping: Vec<u8>,
+}
+
+impl AudioConfiguration {
+    fn create_pipeline(&self, telemetry: AudioTelemetry) -> Result<AudioPipeline, String> {
+        AudioPipeline::new(
+            self.sample_rate,
+            self.channels,
+            self.streams,
+            self.coupled_streams,
+            self.samples_per_frame,
+            &self.mapping,
+            telemetry,
+        )
     }
 }
 
@@ -899,6 +949,7 @@ struct AudioTimeline {
 
 const AUDIO_MAX_BUFFER_NS: u64 = 100_000_000;
 const PIPEWIRE_AUDIO_LATENCY_MS: u64 = 100;
+const AUDIO_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 impl AudioTimeline {
     fn new(sample_rate: i32, samples_per_frame: i32) -> Result<Self, String> {
@@ -965,6 +1016,14 @@ impl PipeWirePlayer {
             .as_ref()
             .map(AsRawFd::as_raw_fd)
             .ok_or_else(|| "pw-play input is closed".to_owned())
+    }
+
+    fn ensure_running(&mut self) -> Result<(), String> {
+        match self.child.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => Err(format!("pw-play exited unexpectedly with {status}")),
+            Err(error) => Err(format!("failed to inspect pw-play: {error}")),
+        }
     }
 }
 
@@ -1046,6 +1105,9 @@ impl AudioPipeline {
     }
 
     fn push(&mut self, packet: Vec<u8>) -> Result<(), String> {
+        if let Some(player) = &mut self.player {
+            player.ensure_running()?;
+        }
         if let Some(diagnostic) = &mut self.encoded_diagnostic {
             let length = u32::try_from(packet.len())
                 .map_err(|_| "encoded Opus diagnostic packet is too large".to_owned())?;
@@ -1205,10 +1267,12 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{
-        AudioOutput, AudioStats, AudioTimeline, PlaybackClock, audio_clock,
+        AudioOutput, AudioStats, AudioTimeline, PipeWirePlayer, PlaybackClock, audio_clock,
         audio_pipeline_description, video_decoder_chain, video_pipeline_description,
     };
     use gstreamer as gst;
@@ -1260,6 +1324,30 @@ mod tests {
         assert_eq!(clock.media_elapsed, 1_000);
         assert_eq!(clock.wall_elapsed, 1_000);
         assert_eq!(clock.drift, 0);
+    }
+
+    #[test]
+    fn pipewire_player_reports_an_exited_child() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 17"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn test child");
+        let stdin = child.stdin.take().expect("test child stdin");
+        let mut player = PipeWirePlayer {
+            child,
+            stdin: Some(stdin),
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let error = loop {
+            match player.ensure_running() {
+                Ok(()) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+                Ok(()) => panic!("test child did not exit"),
+                Err(error) => break error,
+            }
+        };
+        assert!(error.contains("pw-play exited unexpectedly"));
+        assert!(error.contains("17"));
     }
 
     #[test]
