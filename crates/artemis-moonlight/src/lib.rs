@@ -255,7 +255,7 @@ mod tests {
     fn detached_video_is_not_pumped_with_lifecycle_events() {
         let (_control_sender, control) = unbounded();
         let (_audio_sender, audio) = unbounded();
-        let (video_sender, video) = bounded(1);
+        let (video_sender, video) = bounded(2);
         let mut receiver = EventReceiver {
             control,
             audio,
@@ -263,6 +263,14 @@ mod tests {
         };
         let video_receiver = receiver.take_video();
 
+        video_sender
+            .send(StreamEvent::VideoSetup {
+                format: 1,
+                width: 1_920,
+                height: 1_080,
+                fps: 60,
+            })
+            .expect("video receiver should remain connected");
         video_sender
             .send(StreamEvent::VideoFrame {
                 bytes: vec![1],
@@ -272,6 +280,15 @@ mod tests {
             .expect("video receiver should remain connected");
 
         assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            video_receiver.recv_timeout(Duration::from_millis(10)),
+            Ok(StreamEvent::VideoSetup {
+                format: 1,
+                width: 1_920,
+                height: 1_080,
+                fps: 60,
+            })
+        ));
         assert!(matches!(
             video_receiver.recv_timeout(Duration::from_millis(10)),
             Ok(StreamEvent::VideoFrame { bytes, .. }) if bytes == [1]

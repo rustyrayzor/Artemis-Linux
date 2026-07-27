@@ -440,7 +440,7 @@ extern "C" fn on_video_setup(
             return -1;
         };
         context
-            .control
+            .video
             .send(StreamEvent::VideoSetup {
                 format,
                 width,
