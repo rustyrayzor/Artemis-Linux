@@ -109,12 +109,25 @@ pub struct AudioEventReceiver {
     receiver: Receiver<StreamEvent>,
 }
 
+/// Receives encoded video events on a dedicated decode thread.
+pub struct VideoEventReceiver {
+    receiver: Receiver<StreamEvent>,
+}
+
 impl EventReceiver {
     /// Detaches audio delivery from the lifecycle and video event pump.
     pub fn take_audio(&mut self) -> AudioEventReceiver {
         let (_sender, replacement) = unbounded();
         AudioEventReceiver {
             receiver: std::mem::replace(&mut self.audio, replacement),
+        }
+    }
+
+    /// Detaches video delivery from the lifecycle event pump.
+    pub fn take_video(&mut self) -> VideoEventReceiver {
+        let (_sender, replacement) = unbounded();
+        VideoEventReceiver {
+            receiver: std::mem::replace(&mut self.video, replacement),
         }
     }
 
@@ -137,6 +150,21 @@ impl EventReceiver {
 
 impl AudioEventReceiver {
     /// Waits up to `timeout` for the next audio event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Timeout` when no event arrives before the deadline and `Disconnected` after the
+    /// native callback sender has been dropped.
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<StreamEvent, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+}
+
+impl VideoEventReceiver {
+    /// Waits up to `timeout` for the next video event.
     ///
     /// # Errors
     ///
@@ -220,6 +248,33 @@ mod tests {
         assert!(matches!(
             audio_receiver.recv_timeout(Duration::from_millis(10)),
             Ok(StreamEvent::AudioPacket(packet)) if packet == [2]
+        ));
+    }
+
+    #[test]
+    fn detached_video_is_not_pumped_with_lifecycle_events() {
+        let (_control_sender, control) = unbounded();
+        let (_audio_sender, audio) = unbounded();
+        let (video_sender, video) = bounded(1);
+        let mut receiver = EventReceiver {
+            control,
+            audio,
+            video,
+        };
+        let video_receiver = receiver.take_video();
+
+        video_sender
+            .send(StreamEvent::VideoFrame {
+                bytes: vec![1],
+                key_frame: true,
+                presentation_time_us: 0,
+            })
+            .expect("video receiver should remain connected");
+
+        assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            video_receiver.recv_timeout(Duration::from_millis(10)),
+            Ok(StreamEvent::VideoFrame { bytes, .. }) if bytes == [1]
         ));
     }
 

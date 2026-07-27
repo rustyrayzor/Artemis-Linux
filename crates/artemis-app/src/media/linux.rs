@@ -14,7 +14,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use artemis_moonlight::{AudioEventReceiver, StreamEvent};
+use artemis_moonlight::{AudioEventReceiver, StreamEvent, VideoEventReceiver};
 
 pub struct DecodedFrame {
     pub width: usize,
@@ -50,64 +50,32 @@ impl VideoCounters {
 }
 
 pub struct MediaRuntime {
-    video: Option<VideoPipeline>,
+    video: VideoWorker,
     audio: AudioWorker,
     frames: Receiver<DecodedFrame>,
-    frame_sender: crossbeam_channel::Sender<DecodedFrame>,
     video_counters: Arc<VideoCounters>,
     last_video_report_at: Instant,
     last_video_report: VideoStats,
 }
 
 impl MediaRuntime {
-    pub fn new(audio_events: AudioEventReceiver) -> Result<Self, String> {
+    pub fn new(
+        audio_events: AudioEventReceiver,
+        video_events: VideoEventReceiver,
+    ) -> Result<Self, String> {
         gst::init().map_err(|error| error.to_string())?;
         let (frame_sender, frames) = bounded(2);
         let video_counters = Arc::new(VideoCounters::default());
+        let audio = AudioWorker::spawn(audio_events)?;
+        let video = VideoWorker::spawn(video_events, frame_sender, Arc::clone(&video_counters))?;
         Ok(Self {
-            video: None,
-            audio: AudioWorker::spawn(audio_events)?,
+            video,
+            audio,
             frames,
-            frame_sender,
             video_counters,
             last_video_report_at: Instant::now(),
             last_video_report: VideoStats::default(),
         })
-    }
-
-    pub fn handle(&mut self, event: StreamEvent) -> Result<(), String> {
-        match event {
-            StreamEvent::VideoSetup {
-                format,
-                width,
-                height,
-                fps,
-            } => {
-                if format.trailing_zeros() >= 4 {
-                    return Err(format!(
-                        "host selected unsupported video format 0x{format:x}"
-                    ));
-                }
-                self.video = Some(VideoPipeline::new(
-                    width,
-                    height,
-                    fps,
-                    self.frame_sender.clone(),
-                    Arc::clone(&self.video_counters),
-                )?);
-            }
-            StreamEvent::VideoFrame {
-                bytes,
-                key_frame,
-                presentation_time_us,
-            } => {
-                if let Some(video) = &self.video {
-                    video.push(bytes, key_frame, presentation_time_us)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 
     pub fn try_frame(&self) -> Option<DecodedFrame> {
@@ -155,15 +123,131 @@ impl MediaRuntime {
     }
 
     pub fn poll_error(&self) -> Option<String> {
-        self.video
-            .as_ref()
-            .and_then(|video| pipeline_error(&video.pipeline))
-            .or_else(|| self.audio.poll_error())
+        self.video.poll_error().or_else(|| self.audio.poll_error())
     }
 
     pub fn shutdown(&mut self) {
-        self.video.take();
+        self.video.shutdown();
         self.audio.shutdown();
+    }
+}
+
+struct VideoWorker {
+    stop: Sender<()>,
+    errors: Receiver<String>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl VideoWorker {
+    fn spawn(
+        events: VideoEventReceiver,
+        frames: crossbeam_channel::Sender<DecodedFrame>,
+        video_counters: Arc<VideoCounters>,
+    ) -> Result<Self, String> {
+        let (stop, stop_receiver) = bounded(1);
+        let (error_sender, errors) = unbounded();
+        let thread = thread::Builder::new()
+            .name("artemis-video".to_owned())
+            .spawn(move || {
+                run_video_worker(
+                    &events,
+                    &stop_receiver,
+                    &error_sender,
+                    frames,
+                    video_counters,
+                );
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            stop,
+            errors,
+            thread: Some(thread),
+        })
+    }
+
+    fn poll_error(&self) -> Option<String> {
+        self.errors.try_recv().ok()
+    }
+
+    fn shutdown(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let _ = self.stop.try_send(());
+        let _ = thread.join();
+    }
+}
+
+impl Drop for VideoWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_video_worker(
+    events: &VideoEventReceiver,
+    stop: &Receiver<()>,
+    errors: &Sender<String>,
+    frames: crossbeam_channel::Sender<DecodedFrame>,
+    video_counters: Arc<VideoCounters>,
+) {
+    let mut video = None;
+    loop {
+        if stop.try_recv().is_ok() {
+            break;
+        }
+        match events.recv_timeout(Duration::from_millis(10)) {
+            Ok(StreamEvent::VideoSetup {
+                format,
+                width,
+                height,
+                fps,
+            }) => {
+                let result = if format.trailing_zeros() >= 4 {
+                    Err(format!(
+                        "host selected unsupported video format 0x{format:x}"
+                    ))
+                } else {
+                    VideoPipeline::new(
+                        width,
+                        height,
+                        fps,
+                        frames.clone(),
+                        Arc::clone(&video_counters),
+                    )
+                };
+                match result {
+                    Ok(pipeline) => video = Some(pipeline),
+                    Err(error) => {
+                        video = None;
+                        let _ = errors.send(error);
+                    }
+                }
+            }
+            Ok(StreamEvent::VideoFrame {
+                bytes,
+                key_frame,
+                presentation_time_us,
+            }) => {
+                let Some(pipeline) = &video else {
+                    continue;
+                };
+                if let Err(error) = pipeline.push(bytes, key_frame, presentation_time_us) {
+                    video = None;
+                    let _ = errors.send(error);
+                }
+            }
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if let Some(error) = video
+            .as_ref()
+            .and_then(|pipeline| pipeline_error(&pipeline.pipeline))
+        {
+            video = None;
+            let _ = errors.send(error);
+        }
     }
 }
 

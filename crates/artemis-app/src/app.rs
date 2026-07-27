@@ -43,6 +43,8 @@ pub struct ArtemisApp {
 struct StreamTexture {
     id: egui::TextureId,
     native: glow::Texture,
+    pixel_buffers: [glow::Buffer; 2],
+    next_pixel_buffer: usize,
     size: [usize; 2],
 }
 
@@ -405,7 +407,8 @@ impl ArtemisApp {
                     match result {
                         Ok((mut session, mut events)) => {
                             let audio_events = events.take_audio();
-                            match MediaRuntime::new(audio_events) {
+                            let video_events = events.take_video();
+                            match MediaRuntime::new(audio_events, video_events) {
                                 Ok(media) => {
                                     self.status =
                                         format!("Stream connected: {title} at {profile_label}");
@@ -489,15 +492,10 @@ impl ArtemisApp {
                     "The stream connection is unstable.".clone_into(&mut self.status);
                 }
                 StreamEvent::Terminated(error) => terminated = Some(error),
-                event @ (StreamEvent::VideoSetup { .. }
+                StreamEvent::VideoSetup { .. }
                 | StreamEvent::VideoFrame { .. }
                 | StreamEvent::AudioSetup { .. }
-                | StreamEvent::AudioPacket(_)) => {
-                    if let Err(error) = active.media.handle(event) {
-                        self.status = error;
-                        active.session.request_idr();
-                    }
-                }
+                | StreamEvent::AudioPacket(_) => {}
             }
         }
 
@@ -548,20 +546,48 @@ impl ArtemisApp {
         let size = [decoded.width, decoded.height];
         if let Some(texture) = &mut self.texture {
             let allocate = texture.size != size;
-            upload_rgba(&gl, texture.native, decoded, allocate)?;
+            let pixel_buffer = texture.pixel_buffers[texture.next_pixel_buffer];
+            upload_rgba(&gl, texture.native, pixel_buffer, decoded, allocate)?;
+            texture.next_pixel_buffer =
+                (texture.next_pixel_buffer + 1) % texture.pixel_buffers.len();
             texture.size = size;
             return Ok(());
         }
 
         // SAFETY: `gl` is the current eframe rendering context on the UI thread.
         let native = unsafe { gl.create_texture() }.map_err(|error| error.to_string())?;
-        if let Err(error) = upload_rgba(&gl, native, decoded, true) {
-            // SAFETY: This texture was just created in the current context and was not registered.
-            unsafe { gl.delete_texture(native) };
+        // SAFETY: These buffers are created in the same current context as the texture.
+        let first_buffer = unsafe { gl.create_buffer() }.map_err(|error| error.to_string())?;
+        // SAFETY: The context remains current on the UI thread.
+        let second_buffer = match unsafe { gl.create_buffer() } {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                // SAFETY: These unregistered objects were created in this current context.
+                unsafe {
+                    gl.delete_buffer(first_buffer);
+                    gl.delete_texture(native);
+                }
+                return Err(error.to_string());
+            }
+        };
+        let pixel_buffers = [first_buffer, second_buffer];
+        if let Err(error) = upload_rgba(&gl, native, first_buffer, decoded, true) {
+            // SAFETY: These objects were just created in the current context and are unregistered.
+            unsafe {
+                gl.delete_buffer(first_buffer);
+                gl.delete_buffer(second_buffer);
+                gl.delete_texture(native);
+            }
             return Err(error);
         }
         let id = frame.register_native_glow_texture(native);
-        self.texture = Some(StreamTexture { id, native, size });
+        self.texture = Some(StreamTexture {
+            id,
+            native,
+            pixel_buffers,
+            next_pixel_buffer: 1,
+            size,
+        });
         Ok(())
     }
 
@@ -862,6 +888,7 @@ impl ArtemisApp {
 fn upload_rgba(
     gl: &glow::Context,
     texture: glow::Texture,
+    pixel_buffer: glow::Buffer,
     decoded: &DecodedFrame,
     allocate: bool,
 ) -> Result<(), String> {
@@ -883,8 +910,9 @@ fn upload_rgba(
     let internal_format =
         i32::try_from(glow::SRGB8_ALPHA8).map_err(|_| "invalid GL format value".to_owned())?;
 
-    // SAFETY: The texture belongs to this current GL context. The source byte slice is valid for
-    // the duration of the synchronous upload and its validated length matches the RGBA dimensions.
+    // SAFETY: The texture and pixel buffer belong to this current GL context. `buffer_data_u8_slice`
+    // copies the validated source bytes into an orphaned buffer before the asynchronous texture
+    // transfer is queued, so the transfer does not borrow the Rust slice after this block.
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
@@ -902,21 +930,23 @@ fn upload_rgba(
                 0,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&decoded.rgba)),
-            );
-        } else {
-            gl.tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                width,
-                height,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&decoded.rgba)),
+                glow::PixelUnpackData::Slice(None),
             );
         }
+        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pixel_buffer));
+        gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, &decoded.rgba, glow::STREAM_DRAW);
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            0,
+            0,
+            width,
+            height,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::BufferOffset(0),
+        );
+        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
         gl.bind_texture(glow::TEXTURE_2D, None);
     }
     Ok(())
