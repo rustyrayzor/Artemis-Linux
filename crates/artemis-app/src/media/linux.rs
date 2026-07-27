@@ -559,12 +559,8 @@ fn signed_difference_millis(left_us: u64, right_us: u64) -> i64 {
     } else {
         (false, right_us - left_us)
     };
-    let difference_ms = i64::try_from(difference_us / 1_000).unwrap_or(i64::MAX);
-    if positive {
-        difference_ms
-    } else {
-        -difference_ms
-    }
+    let converted = i64::try_from(difference_us / 1_000).unwrap_or(i64::MAX);
+    if positive { converted } else { -converted }
 }
 
 fn rate_per_second(current: u64, previous: u64, seconds: f64) -> f64 {
