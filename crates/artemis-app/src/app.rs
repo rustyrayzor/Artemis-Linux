@@ -12,7 +12,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::controller::ControllerManager;
 use crate::input::InputRouter;
-use crate::media::{DecodedFrame, MediaRuntime};
+use crate::media::{DecodedFrame, GlInteropContext, MediaRuntime};
 use crate::video_texture::StreamTexture;
 
 const DEFAULT_HTTP_PORT: u16 = 47_989;
@@ -34,6 +34,7 @@ pub struct ArtemisApp {
     tasks: Sender<TaskMessage>,
     task_results: Receiver<TaskMessage>,
     active_stream: Option<ActiveStream>,
+    gl_interop: Option<GlInteropContext>,
     texture: Option<StreamTexture>,
     stream_preset: StreamPreset,
     stream_bitrate: StreamBitrate,
@@ -85,6 +86,30 @@ impl ArtemisApp {
         let paired_hosts = store.load().unwrap_or_default();
         let (tasks, task_results) = unbounded();
         let stream_preset = StreamPreset::default();
+        let gl_interop = match GlInteropContext::new(context) {
+            Ok(Some(context)) => {
+                tracing::info!(
+                    target: "artemis::media",
+                    "EGL video interop is available"
+                );
+                Some(context)
+            }
+            Ok(None) => {
+                tracing::info!(
+                    target: "artemis::media",
+                    "EGL video interop is unavailable; using CPU video upload"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "artemis::media",
+                    %error,
+                    "could not initialize EGL video interop; using CPU video upload"
+                );
+                None
+            }
+        };
         let mut app = Self {
             identity,
             store,
@@ -102,6 +127,7 @@ impl ArtemisApp {
             tasks,
             task_results,
             active_stream: None,
+            gl_interop,
             texture: None,
             stream_preset,
             stream_bitrate: stream_preset.default_bitrate(),
@@ -392,7 +418,11 @@ impl ArtemisApp {
                         Ok((mut session, mut events)) => {
                             let audio_events = events.take_audio();
                             let video_events = events.take_video();
-                            match MediaRuntime::new(audio_events, video_events) {
+                            match MediaRuntime::new(
+                                audio_events,
+                                video_events,
+                                self.gl_interop.clone(),
+                            ) {
                                 Ok(media) => {
                                     self.status =
                                         format!("Stream connected: {title} at {profile_label}");

@@ -1,3 +1,4 @@
+use std::ffi::c_void;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::fd::AsRawFd;
@@ -10,9 +11,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use eframe::glow::{self, HasContext};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_gl as gst_gl;
+use gstreamer_gl::prelude::*;
+use gstreamer_gl_egl as gst_gl_egl;
 use gstreamer_video as gst_video;
 
 use artemis_moonlight::{
@@ -23,7 +28,121 @@ pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
     pub(crate) sample: gst::Sample,
+    pub(crate) gl_context: Option<gst_gl::GLContext>,
     pub presentation_time_us: u64,
+}
+
+#[derive(Clone)]
+pub struct GlInteropContext {
+    display: gst_gl::GLDisplay,
+    context: gst_gl::GLContext,
+}
+
+impl GlInteropContext {
+    #[allow(unsafe_code)]
+    pub fn new(context: &eframe::CreationContext<'_>) -> Result<Option<Self>, String> {
+        gst::init().map_err(|error| error.to_string())?;
+        let Some(get_proc_address) = context.get_proc_address else {
+            return Ok(None);
+        };
+        let egl_get_current_display = get_proc_address(c"eglGetCurrentDisplay");
+        if egl_get_current_display.is_null() {
+            return Ok(None);
+        }
+        type EglGetCurrentDisplay = unsafe extern "C" fn() -> *mut c_void;
+        // SAFETY: eframe's GL loader returned the address for the exact EGL function signature.
+        let egl_get_current_display = unsafe {
+            std::mem::transmute::<*const c_void, EglGetCurrentDisplay>(egl_get_current_display)
+        };
+        // SAFETY: eframe's OpenGL context is current while the app creator is running.
+        let egl_display = unsafe { egl_get_current_display() } as usize;
+        let egl_context = gst_gl::GLContext::current_gl_context(gst_gl::GLPlatform::EGL);
+        if egl_display == 0 || egl_context == 0 {
+            return Ok(None);
+        }
+        let api = current_gl_api(context)?;
+        // SAFETY: Both handles are queried from eframe's current EGL context. The display and
+        // context remain owned by eframe; the GStreamer wrappers are explicitly foreign wrappers.
+        let display = unsafe { gst_gl_egl::GLDisplayEGL::with_egl_display(egl_display) }
+            .map_err(|error| error.to_string())?
+            .upcast::<gst_gl::GLDisplay>();
+        // SAFETY: The EGL context handle belongs to the wrapped EGL display and remains valid for
+        // the whole eframe application lifetime.
+        let wrapped = unsafe {
+            gst_gl::GLContext::new_wrapped(&display, egl_context, gst_gl::GLPlatform::EGL, api)
+        }
+        .ok_or_else(|| "GStreamer could not wrap eframe's EGL context".to_owned())?;
+        wrapped.activate(true).map_err(|error| error.to_string())?;
+        wrapped.fill_info().map_err(|error| error.to_string())?;
+        Ok(Some(Self {
+            display,
+            context: wrapped,
+        }))
+    }
+
+    fn configure_pipeline(&self, pipeline: &gst::Pipeline) -> Result<(), String> {
+        let display_context = gl_display_context(&self.display);
+        let app_context = gl_app_context(&self.context)?;
+        pipeline.set_context(&display_context);
+        pipeline.set_context(&app_context);
+
+        let display = self.display.clone();
+        let context = self.context.clone();
+        let bus = pipeline
+            .bus()
+            .ok_or_else(|| "video pipeline has no message bus".to_owned())?;
+        bus.set_sync_handler(move |_, message| {
+            let gst::MessageView::NeedContext(needed) = message.view() else {
+                return gst::BusSyncReply::Pass;
+            };
+            let Some(element) = message
+                .src()
+                .and_then(|source| source.downcast_ref::<gst::Element>())
+            else {
+                return gst::BusSyncReply::Pass;
+            };
+            if needed.context_type() == gst_gl::GL_DISPLAY_CONTEXT_TYPE.as_str() {
+                element.set_context(&gl_display_context(&display));
+            } else if needed.context_type() == "gst.gl.app_context"
+                && let Ok(app_context) = gl_app_context(&context)
+            {
+                element.set_context(&app_context);
+            }
+            gst::BusSyncReply::Pass
+        });
+        Ok(())
+    }
+}
+
+#[allow(unsafe_code)]
+fn current_gl_api(context: &eframe::CreationContext<'_>) -> Result<gst_gl::GLAPI, String> {
+    let gl = context
+        .gl
+        .as_ref()
+        .ok_or_else(|| "eframe did not expose its OpenGL context".to_owned())?;
+    // SAFETY: eframe's OpenGL context is current while the app creator is running.
+    let version = unsafe { gl.get_parameter_string(glow::VERSION) };
+    if version.starts_with("OpenGL ES") {
+        Ok(gst_gl::GLAPI::GLES2)
+    } else {
+        Ok(gst_gl::GLAPI::OPENGL | gst_gl::GLAPI::OPENGL3)
+    }
+}
+
+fn gl_display_context(display: &gst_gl::GLDisplay) -> gst::Context {
+    let context = gst::Context::new(gst_gl::GL_DISPLAY_CONTEXT_TYPE.as_str(), true);
+    context.set_gl_display(Some(display));
+    context
+}
+
+fn gl_app_context(context: &gst_gl::GLContext) -> Result<gst::Context, String> {
+    let mut app_context = gst::Context::new("gst.gl.app_context", true);
+    app_context
+        .get_mut()
+        .ok_or_else(|| "GStreamer GL app context is unexpectedly shared".to_owned())?
+        .structure_mut()
+        .set("context", context.clone());
+    Ok(app_context)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -126,6 +245,7 @@ impl MediaRuntime {
     pub fn new(
         audio_events: AudioEventReceiver,
         video_events: VideoEventReceiver,
+        gl_interop: Option<GlInteropContext>,
     ) -> Result<Self, String> {
         gst::init().map_err(|error| error.to_string())?;
         let clock_origin = Instant::now();
@@ -133,7 +253,12 @@ impl MediaRuntime {
         let video_counters = Arc::new(VideoCounters::default());
         let audio_counters = Arc::new(AudioCounters::default());
         let audio = AudioWorker::spawn(audio_events, Arc::clone(&audio_counters), clock_origin)?;
-        let video = VideoWorker::spawn(video_events, frame_sender, Arc::clone(&video_counters))?;
+        let video = VideoWorker::spawn(
+            video_events,
+            frame_sender,
+            Arc::clone(&video_counters),
+            gl_interop,
+        )?;
         Ok(Self {
             video,
             audio,
@@ -274,6 +399,7 @@ impl VideoWorker {
         events: VideoEventReceiver,
         frames: crossbeam_channel::Sender<DecodedFrame>,
         video_counters: Arc<VideoCounters>,
+        gl_interop: Option<GlInteropContext>,
     ) -> Result<Self, String> {
         let (stop, stop_receiver) = bounded(1);
         let (error_sender, errors) = unbounded();
@@ -286,6 +412,7 @@ impl VideoWorker {
                     &error_sender,
                     &frames,
                     &video_counters,
+                    gl_interop,
                 );
             })
             .map_err(|error| error.to_string())?;
@@ -321,6 +448,7 @@ fn run_video_worker(
     errors: &Sender<String>,
     frames: &crossbeam_channel::Sender<DecodedFrame>,
     video_counters: &Arc<VideoCounters>,
+    gl_interop: Option<GlInteropContext>,
 ) {
     let mut video = None;
     loop {
@@ -345,6 +473,7 @@ fn run_video_worker(
                         fps,
                         frames.clone(),
                         Arc::clone(video_counters),
+                        gl_interop.clone(),
                     )
                 };
                 match result {
@@ -395,13 +524,18 @@ impl VideoPipeline {
         _fps: i32,
         frames: crossbeam_channel::Sender<DecodedFrame>,
         video_counters: Arc<VideoCounters>,
+        gl_interop: Option<GlInteropContext>,
     ) -> Result<Self, String> {
         let has_va_decoder = gst::ElementFactory::find("vah264dec").is_some();
-        let description = video_pipeline_description(width, height, has_va_decoder);
+        let use_gl_interop = has_va_decoder && gl_interop.is_some();
+        let description = video_pipeline_description(width, height, has_va_decoder, use_gl_interop);
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
             .downcast::<gst::Pipeline>()
             .map_err(|_| "GStreamer did not construct a video pipeline".to_owned())?;
+        if let Some(gl_interop) = &gl_interop {
+            gl_interop.configure_pipeline(&pipeline)?;
+        }
         let source = pipeline
             .by_name("video_src")
             .ok_or_else(|| "video appsrc is missing".to_owned())?
@@ -412,6 +546,12 @@ impl VideoPipeline {
             .ok_or_else(|| "video appsink is missing".to_owned())?
             .downcast::<gst_app::AppSink>()
             .map_err(|_| "video sink has the wrong GStreamer type".to_owned())?;
+        let gl_producer = if use_gl_interop {
+            pipeline.by_name("gl_convert")
+        } else {
+            None
+        };
+        let frame_gl_context = gl_interop.map(|interop| interop.context);
         let callback_counters = Arc::clone(&video_counters);
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
@@ -425,21 +565,30 @@ impl VideoPipeline {
                     let caps = sample.caps().ok_or(gst::FlowError::NotNegotiated)?;
                     let info = gst_video::VideoInfo::from_caps(caps)
                         .map_err(|_| gst::FlowError::NotNegotiated)?;
-                    if info.format() != gst_video::VideoFormat::Nv12 {
+                    if !matches!(
+                        info.format(),
+                        gst_video::VideoFormat::Nv12 | gst_video::VideoFormat::Rgba
+                    ) {
                         return Err(gst::FlowError::NotNegotiated);
                     }
                     let width = usize::try_from(info.width()).map_err(|_| gst::FlowError::Error)?;
                     let height =
                         usize::try_from(info.height()).map_err(|_| gst::FlowError::Error)?;
-                    let presentation_time_us = sample
-                        .buffer()
-                        .ok_or(gst::FlowError::Error)?
-                        .pts()
-                        .map_or(0, gst::ClockTime::useconds);
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let presentation_time_us = buffer.pts().map_or(0, gst::ClockTime::useconds);
+                    if info.format() == gst_video::VideoFormat::Rgba
+                        && let (Some(sync), Some(producer)) =
+                            (buffer.meta::<gst_gl::GLSyncMeta>(), gl_producer.as_ref())
+                        && let Some(producer_context) =
+                            producer.property::<Option<gst_gl::GLContext>>("context")
+                    {
+                        sync.set_sync_point(&producer_context);
+                    }
                     let frame = DecodedFrame {
                         width,
                         height,
                         sample,
+                        gl_context: frame_gl_context.clone(),
                         presentation_time_us,
                     };
                     let _ = frames.try_send(frame);
@@ -551,8 +700,25 @@ fn video_decoder_chain(hardware_available: bool) -> &'static str {
     }
 }
 
-fn video_pipeline_description(width: i32, height: i32, hardware_available: bool) -> String {
+fn video_pipeline_description(
+    width: i32,
+    height: i32,
+    hardware_available: bool,
+    gl_interop_available: bool,
+) -> String {
     let decoder_chain = video_decoder_chain(hardware_available);
+    if hardware_available && gl_interop_available {
+        return format!(
+            "appsrc name=video_src is-live=true format=time do-timestamp=false \
+             caps=video/x-h264,stream-format=byte-stream,alignment=au ! \
+             h264parse config-interval=-1 ! {decoder_chain} ! \
+             video/x-raw(memory:DMABuf),format=DMA_DRM,width={width},height={height} ! \
+             glupload ! glcolorconvert name=gl_convert ! \
+             video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D,\
+             width={width},height={height} ! \
+             appsink name=video_sink max-buffers=2 drop=true sync=false"
+        );
+    }
     format!(
         "appsrc name=video_src is-live=true format=time do-timestamp=false \
          caps=video/x-h264,stream-format=byte-stream,alignment=au ! \
@@ -1108,10 +1274,20 @@ mod tests {
 
     #[test]
     fn video_pipeline_preserves_native_stream_resolution_without_a_frame_rate_cap() {
-        let description = video_pipeline_description(3840, 2160, true);
+        let description = video_pipeline_description(3840, 2160, true, false);
 
         assert!(description.contains("video/x-raw,format=NV12,width=3840,height=2160"));
         assert!(!description.contains("videorate"));
         assert!(!description.contains("max-rate=30"));
+    }
+
+    #[test]
+    fn video_pipeline_keeps_va_frames_on_the_gpu_when_egl_interop_is_available() {
+        let description = video_pipeline_description(3840, 2160, true, true);
+
+        assert!(description.contains("video/x-raw(memory:DMABuf),format=DMA_DRM"));
+        assert!(description.contains("glupload ! glcolorconvert name=gl_convert"));
+        assert!(description.contains("video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D"));
+        assert!(!description.contains("video/x-raw,format=NV12"));
     }
 }

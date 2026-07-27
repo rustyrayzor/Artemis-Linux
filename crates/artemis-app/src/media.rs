@@ -4,6 +4,6 @@ mod linux;
 mod unsupported;
 
 #[cfg(target_os = "linux")]
-pub use linux::{DecodedFrame, MediaRuntime};
+pub use linux::{DecodedFrame, GlInteropContext, MediaRuntime};
 #[cfg(not(target_os = "linux"))]
-pub use unsupported::{DecodedFrame, MediaRuntime};
+pub use unsupported::{DecodedFrame, GlInteropContext, MediaRuntime};

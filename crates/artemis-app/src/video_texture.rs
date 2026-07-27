@@ -5,6 +5,12 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::glow::{self, HasContext};
 #[cfg(target_os = "linux")]
+use gstreamer as gst;
+#[cfg(target_os = "linux")]
+use gstreamer_gl as gst_gl;
+#[cfg(target_os = "linux")]
+use gstreamer_gl::GLVideoFrameExt;
+#[cfg(target_os = "linux")]
 use gstreamer_video as gst_video;
 #[cfg(target_os = "linux")]
 use gstreamer_video::VideoFrameExt;
@@ -59,6 +65,7 @@ pub struct StreamTexture {
     chroma_uniform: glow::UniformLocation,
     vertex_array: glow::VertexArray,
     framebuffer: glow::Framebuffer,
+    source_framebuffer: glow::Framebuffer,
     size: [usize; 2],
 }
 
@@ -84,6 +91,7 @@ impl StreamTexture {
             chroma_uniform: resources.chroma_uniform,
             vertex_array: resources.vertex_array,
             framebuffer: resources.framebuffer,
+            source_framebuffer: resources.source_framebuffer,
             size: [0, 0],
         };
         texture.upload(decoded)?;
@@ -109,12 +117,6 @@ impl StreamTexture {
                 .ok_or_else(|| "decoded video sample has no caps".to_owned())?;
             let info = gst_video::VideoInfo::from_caps(caps)
                 .map_err(|error| format!("invalid decoded video caps: {error}"))?;
-            if info.format() != gst_video::VideoFormat::Nv12 {
-                return Err(format!(
-                    "decoded video format is {:?}; expected NV12",
-                    info.format()
-                ));
-            }
             let width = usize::try_from(info.width())
                 .map_err(|_| "decoded video width is too large".to_owned())?;
             let height = usize::try_from(info.height())
@@ -123,6 +125,15 @@ impl StreamTexture {
                 return Err(format!(
                     "decoded video caps are {width}x{height}; expected {}x{}",
                     decoded.width, decoded.height
+                ));
+            }
+            if info.format() == gst_video::VideoFormat::Rgba {
+                return self.upload_gl_frame(decoded, &info);
+            }
+            if info.format() != gst_video::VideoFormat::Nv12 {
+                return Err(format!(
+                    "decoded video format is {:?}; expected NV12 or RGBA",
+                    info.format()
                 ));
             }
             let buffer = decoded
@@ -174,6 +185,104 @@ impl StreamTexture {
                 decoded.width,
             )
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn upload_gl_frame(
+        &mut self,
+        decoded: &DecodedFrame,
+        info: &gst_video::VideoInfo,
+    ) -> Result<(), String> {
+        let context = decoded
+            .gl_context
+            .as_ref()
+            .ok_or_else(|| "decoded GL frame has no application GL context".to_owned())?;
+        let buffer = decoded
+            .sample
+            .buffer()
+            .ok_or_else(|| "decoded GL sample has no buffer".to_owned())?;
+        let sync = buffer
+            .meta::<gst_gl::GLSyncMeta>()
+            .ok_or_else(|| "decoded GL frame has no synchronization metadata".to_owned())?;
+        sync.wait(context);
+        let frame = gst_gl::GLVideoFrameRef::from_buffer_ref_readable(buffer, info)
+            .map_err(|error| format!("could not map decoded GL frame: {error}"))?;
+        if frame.texture_target(0).map_err(|error| error.to_string())?
+            != gst_gl::GLTextureTarget::_2d
+        {
+            return Err("decoded GL frame is not a 2D texture".to_owned());
+        }
+        let source_name = frame.texture_id(0).map_err(|error| error.to_string())?;
+        let source_name = std::num::NonZeroU32::new(source_name)
+            .ok_or_else(|| "decoded GL frame has an invalid texture name".to_owned())?;
+        let source = glow::NativeTexture(source_name);
+        let width = i32::try_from(decoded.width)
+            .map_err(|_| "decoded video width is too large".to_owned())?;
+        let height = i32::try_from(decoded.height)
+            .map_err(|_| "decoded video height is too large".to_owned())?;
+
+        // SAFETY: The producer texture belongs to a context that shares objects with eframe's
+        // current context. GLSyncMeta has completed the cross-context wait before the texture is
+        // attached, and both framebuffers are valid for this context.
+        unsafe {
+            if self.size != [decoded.width, decoded.height] {
+                allocate_textures(
+                    &self.gl,
+                    self.output,
+                    self.luma,
+                    self.chroma,
+                    self.framebuffer,
+                    width,
+                    height,
+                )?;
+            }
+            let srgb_enabled = self.gl.is_enabled(glow::FRAMEBUFFER_SRGB);
+            self.gl.disable(glow::FRAMEBUFFER_SRGB);
+            self.gl
+                .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.source_framebuffer));
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(source),
+                0,
+            );
+            let source_status = self.gl.check_framebuffer_status(glow::READ_FRAMEBUFFER);
+            if source_status != glow::FRAMEBUFFER_COMPLETE {
+                self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+                if srgb_enabled {
+                    self.gl.enable(glow::FRAMEBUFFER_SRGB);
+                }
+                return Err(format!(
+                    "decoded GL framebuffer is incomplete: 0x{source_status:x}"
+                ));
+            }
+            self.gl
+                .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.framebuffer));
+            self.gl.blit_framebuffer(
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
+            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            self.gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+            if srgb_enabled {
+                self.gl.enable(glow::FRAMEBUFFER_SRGB);
+            }
+            let error = self.gl.get_error();
+            if error != glow::NO_ERROR {
+                return Err(format!("OpenGL video copy failed with error 0x{error:x}"));
+            }
+        }
+        self.size = [decoded.width, decoded.height];
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -285,6 +394,7 @@ impl Drop for StreamTexture {
             self.gl.delete_program(self.program);
             self.gl.delete_vertex_array(self.vertex_array);
             self.gl.delete_framebuffer(self.framebuffer);
+            self.gl.delete_framebuffer(self.source_framebuffer);
         }
     }
 }
@@ -299,6 +409,7 @@ struct Resources {
     chroma_uniform: glow::UniformLocation,
     vertex_array: glow::VertexArray,
     framebuffer: glow::Framebuffer,
+    source_framebuffer: glow::Framebuffer,
 }
 
 #[allow(unsafe_code)]
@@ -387,6 +498,20 @@ unsafe fn create_resources(gl: &glow::Context) -> Result<Resources, String> {
                 return Err(error);
             }
         };
+        let source_framebuffer = match gl.create_framebuffer() {
+            Ok(framebuffer) => framebuffer,
+            Err(error) => {
+                gl.delete_framebuffer(framebuffer);
+                gl.delete_vertex_array(vertex_array);
+                delete_program_resources(
+                    gl,
+                    program,
+                    [first_buffer, second_buffer],
+                    [output, luma, chroma],
+                );
+                return Err(error);
+            }
+        };
         Ok(Resources {
             output,
             luma,
@@ -397,6 +522,7 @@ unsafe fn create_resources(gl: &glow::Context) -> Result<Resources, String> {
             chroma_uniform,
             vertex_array,
             framebuffer,
+            source_framebuffer,
         })
     }
 }

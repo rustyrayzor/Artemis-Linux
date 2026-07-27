@@ -1,5 +1,14 @@
 use artemis_moonlight::{AudioEventReceiver, Session, VideoEventReceiver};
 
+#[derive(Clone)]
+pub struct GlInteropContext;
+
+impl GlInteropContext {
+    pub fn new(_context: &eframe::CreationContext<'_>) -> Result<Option<Self>, String> {
+        Ok(None)
+    }
+}
+
 pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
@@ -14,6 +23,7 @@ impl MediaRuntime {
     pub fn new(
         _audio_events: AudioEventReceiver,
         _video_events: VideoEventReceiver,
+        _gl_interop: Option<GlInteropContext>,
     ) -> Result<Self, String> {
         Err("streaming media is supported only on Linux".to_owned())
     }
