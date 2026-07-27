@@ -3,6 +3,7 @@ mod controller;
 mod diagnostics;
 mod input;
 mod media;
+mod video_texture;
 
 use anyhow::Context;
 use artemis_core::{ClientIdentity, HostStore};

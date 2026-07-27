@@ -9,11 +9,11 @@ use artemis_core::{
 use artemis_moonlight::{ConnectionQuality, EventReceiver, Session, StreamConfig, StreamEvent};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{self, Color32, RichText};
-use eframe::glow::{self, HasContext};
 
 use crate::controller::ControllerManager;
 use crate::input::InputRouter;
 use crate::media::{DecodedFrame, MediaRuntime};
+use crate::video_texture::StreamTexture;
 
 const DEFAULT_HTTP_PORT: u16 = 47_989;
 
@@ -38,22 +38,6 @@ pub struct ArtemisApp {
     stream_preset: StreamPreset,
     stream_bitrate: StreamBitrate,
     fullscreen: bool,
-}
-
-struct StreamTexture {
-    id: egui::TextureId,
-    native: glow::Texture,
-    pixel_buffers: [glow::Buffer; 2],
-    next_pixel_buffer: usize,
-    size: [usize; 2],
-}
-
-impl StreamTexture {
-    fn size_vec2(&self) -> egui::Vec2 {
-        let width = u16::try_from(self.size[0]).unwrap_or(u16::MAX);
-        let height = u16::try_from(self.size[1]).unwrap_or(u16::MAX);
-        egui::vec2(f32::from(width), f32::from(height))
-    }
 }
 
 struct ActiveStream {
@@ -533,61 +517,16 @@ impl ArtemisApp {
         }
     }
 
-    #[allow(unsafe_code)]
     fn upload_stream_frame(
         &mut self,
         frame: &mut eframe::Frame,
         decoded: &DecodedFrame,
     ) -> Result<(), String> {
-        let gl = frame
-            .gl()
-            .cloned()
-            .ok_or_else(|| "the OpenGL renderer is unavailable".to_owned())?;
-        let size = [decoded.width, decoded.height];
         if let Some(texture) = &mut self.texture {
-            let allocate = texture.size != size;
-            let pixel_buffer = texture.pixel_buffers[texture.next_pixel_buffer];
-            upload_rgba(&gl, texture.native, pixel_buffer, decoded, allocate)?;
-            texture.next_pixel_buffer =
-                (texture.next_pixel_buffer + 1) % texture.pixel_buffers.len();
-            texture.size = size;
-            return Ok(());
+            return texture.upload(decoded);
         }
 
-        // SAFETY: `gl` is the current eframe rendering context on the UI thread.
-        let native = unsafe { gl.create_texture() }.map_err(|error| error.to_string())?;
-        // SAFETY: These buffers are created in the same current context as the texture.
-        let first_buffer = unsafe { gl.create_buffer() }.map_err(|error| error.to_string())?;
-        // SAFETY: The context remains current on the UI thread.
-        let second_buffer = match unsafe { gl.create_buffer() } {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                // SAFETY: These unregistered objects were created in this current context.
-                unsafe {
-                    gl.delete_buffer(first_buffer);
-                    gl.delete_texture(native);
-                }
-                return Err(error.to_string());
-            }
-        };
-        let pixel_buffers = [first_buffer, second_buffer];
-        if let Err(error) = upload_rgba(&gl, native, first_buffer, decoded, true) {
-            // SAFETY: These objects were just created in the current context and are unregistered.
-            unsafe {
-                gl.delete_buffer(first_buffer);
-                gl.delete_buffer(second_buffer);
-                gl.delete_texture(native);
-            }
-            return Err(error);
-        }
-        let id = frame.register_native_glow_texture(native);
-        self.texture = Some(StreamTexture {
-            id,
-            native,
-            pixel_buffers,
-            next_pixel_buffer: 1,
-            size,
-        });
+        self.texture = Some(StreamTexture::new(frame, decoded)?);
         Ok(())
     }
 
@@ -873,7 +812,7 @@ impl ArtemisApp {
                         .max(0.01);
                     let size = source * scale;
                     ui.centered_and_justified(|ui| {
-                        ui.image((texture.id, size));
+                        ui.image((texture.id(), size));
                     });
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -882,74 +821,6 @@ impl ArtemisApp {
                 }
             });
     }
-}
-
-#[allow(unsafe_code)]
-fn upload_rgba(
-    gl: &glow::Context,
-    texture: glow::Texture,
-    pixel_buffer: glow::Buffer,
-    decoded: &DecodedFrame,
-    allocate: bool,
-) -> Result<(), String> {
-    let expected_bytes = decoded
-        .width
-        .checked_mul(decoded.height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| "decoded video dimensions overflowed".to_owned())?;
-    if decoded.rgba.len() != expected_bytes {
-        return Err("decoded video buffer has an invalid length".to_owned());
-    }
-    let width =
-        i32::try_from(decoded.width).map_err(|_| "decoded video width is too large".to_owned())?;
-    let height = i32::try_from(decoded.height)
-        .map_err(|_| "decoded video height is too large".to_owned())?;
-    let linear = i32::try_from(glow::LINEAR).map_err(|_| "invalid GL filter value".to_owned())?;
-    let clamp =
-        i32::try_from(glow::CLAMP_TO_EDGE).map_err(|_| "invalid GL wrap value".to_owned())?;
-    let internal_format =
-        i32::try_from(glow::SRGB8_ALPHA8).map_err(|_| "invalid GL format value".to_owned())?;
-
-    // SAFETY: The texture and pixel buffer belong to this current GL context. `buffer_data_u8_slice`
-    // copies the validated source bytes into an orphaned buffer before the asynchronous texture
-    // transfer is queued, so the transfer does not borrow the Rust slice after this block.
-    unsafe {
-        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        if allocate {
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, linear);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, linear);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, clamp);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, clamp);
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                internal_format,
-                width,
-                height,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(None),
-            );
-        }
-        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pixel_buffer));
-        gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, &decoded.rgba, glow::STREAM_DRAW);
-        gl.tex_sub_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            0,
-            0,
-            width,
-            height,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::BufferOffset(0),
-        );
-        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
-        gl.bind_texture(glow::TEXTURE_2D, None);
-    }
-    Ok(())
 }
 
 impl eframe::App for ArtemisApp {

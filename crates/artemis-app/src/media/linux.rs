@@ -19,7 +19,7 @@ use artemis_moonlight::{AudioEventReceiver, StreamEvent, VideoEventReceiver};
 pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
-    pub rgba: Vec<u8>,
+    pub nv12: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -265,8 +265,7 @@ impl VideoPipeline {
         frames: crossbeam_channel::Sender<DecodedFrame>,
         video_counters: Arc<VideoCounters>,
     ) -> Result<Self, String> {
-        let has_va_decoder = gst::ElementFactory::find("vah264dec").is_some()
-            && gst::ElementFactory::find("vapostproc").is_some();
+        let has_va_decoder = gst::ElementFactory::find("vah264dec").is_some();
         let description = video_pipeline_description(width, height, has_va_decoder);
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
@@ -302,10 +301,27 @@ impl VideoPipeline {
                         .map_err(|_| gst::FlowError::NotNegotiated)?;
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    let width = usize::try_from(width).map_err(|_| gst::FlowError::Error)?;
+                    let height = usize::try_from(height).map_err(|_| gst::FlowError::Error)?;
+                    let expected_bytes = width
+                        .checked_mul(height)
+                        .and_then(|luma| luma.checked_add(luma / 2))
+                        .ok_or(gst::FlowError::Error)?;
+                    let bytes = map.as_slice();
+                    if bytes.len() != expected_bytes {
+                        tracing::error!(
+                            width,
+                            height,
+                            actual_bytes = bytes.len(),
+                            expected_bytes,
+                            "decoded NV12 buffer has an unexpected layout"
+                        );
+                        return Err(gst::FlowError::Error);
+                    }
                     let frame = DecodedFrame {
-                        width: usize::try_from(width).map_err(|_| gst::FlowError::Error)?,
-                        height: usize::try_from(height).map_err(|_| gst::FlowError::Error)?,
-                        rgba: map.as_slice().to_vec(),
+                        width,
+                        height,
+                        nv12: bytes.to_vec(),
                     };
                     let _ = frames.try_send(frame);
                     Ok(gst::FlowSuccess::Ok)
@@ -359,9 +375,9 @@ impl Drop for VideoPipeline {
 
 fn video_decoder_chain(hardware_available: bool) -> &'static str {
     if hardware_available {
-        "vah264dec ! vapostproc"
+        "vah264dec"
     } else {
-        "avdec_h264 ! videoconvert"
+        "avdec_h264"
     }
 }
 
@@ -371,7 +387,7 @@ fn video_pipeline_description(width: i32, height: i32, hardware_available: bool)
         "appsrc name=video_src is-live=true format=time do-timestamp=false \
          caps=video/x-h264,stream-format=byte-stream,alignment=au ! \
          h264parse config-interval=-1 ! {decoder_chain} ! \
-         video/x-raw,format=RGBA,width={width},height={height} ! \
+         video/x-raw,format=NV12,width={width},height={height} ! \
          appsink name=video_sink max-buffers=2 drop=true sync=false"
     )
 }
@@ -852,15 +868,15 @@ mod tests {
 
     #[test]
     fn video_decoder_prefers_va_api_when_available() {
-        assert_eq!(video_decoder_chain(true), "vah264dec ! vapostproc");
-        assert_eq!(video_decoder_chain(false), "avdec_h264 ! videoconvert");
+        assert_eq!(video_decoder_chain(true), "vah264dec");
+        assert_eq!(video_decoder_chain(false), "avdec_h264");
     }
 
     #[test]
     fn video_pipeline_preserves_native_stream_resolution_without_a_frame_rate_cap() {
         let description = video_pipeline_description(3840, 2160, true);
 
-        assert!(description.contains("video/x-raw,format=RGBA,width=3840,height=2160"));
+        assert!(description.contains("video/x-raw,format=NV12,width=3840,height=2160"));
         assert!(!description.contains("videorate"));
         assert!(!description.contains("max-rate=30"));
     }

@@ -3,7 +3,7 @@ use artemis_moonlight::{AudioEventReceiver, VideoEventReceiver};
 pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
-    pub rgba: Vec<u8>,
+    pub nv12: Vec<u8>,
 }
 
 pub struct MediaRuntime;
