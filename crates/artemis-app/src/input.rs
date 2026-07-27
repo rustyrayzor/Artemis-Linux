@@ -20,7 +20,12 @@ impl InputRouter {
         }
     }
 
-    pub fn forward(&mut self, context: &egui::Context, session: &mut Session) {
+    pub fn forward(
+        &mut self,
+        context: &egui::Context,
+        session: &mut Session,
+        suppress_escape: bool,
+    ) {
         let events = context.input(|input| input.raw.events.clone());
         for event in events {
             match event {
@@ -64,7 +69,11 @@ impl InputRouter {
                     if repeat {
                         continue;
                     }
-                    if let Some(key) = virtual_key(physical_key.unwrap_or(key)) {
+                    let key = physical_key.unwrap_or(key);
+                    if is_local_shortcut(key, suppress_escape) {
+                        continue;
+                    }
+                    if let Some(key) = virtual_key(key) {
                         if pressed {
                             self.pressed_keys.insert(key);
                         } else {
@@ -92,6 +101,10 @@ impl InputRouter {
             let _ = session.mouse_button(BUTTON_ACTION_RELEASE, button);
         }
     }
+}
+
+fn is_local_shortcut(key: Key, suppress_escape: bool) -> bool {
+    matches!(key, Key::F10 | Key::F11) || (suppress_escape && key == Key::Escape)
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -197,4 +210,20 @@ fn virtual_key(key: Key) -> Option<i16> {
         Key::Quote => 0xDE,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui::Key;
+
+    use super::is_local_shortcut;
+
+    #[test]
+    fn local_stream_shortcuts_are_not_forwarded_to_the_host() {
+        assert!(is_local_shortcut(Key::F10, false));
+        assert!(is_local_shortcut(Key::F11, false));
+        assert!(is_local_shortcut(Key::Escape, true));
+        assert!(!is_local_shortcut(Key::Escape, false));
+        assert!(!is_local_shortcut(Key::F12, true));
+    }
 }

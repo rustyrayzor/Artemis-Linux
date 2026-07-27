@@ -1,5 +1,7 @@
 use artemis_moonlight::{AudioEventReceiver, Session, VideoEventReceiver};
 
+use super::StreamDiagnostics;
+
 #[derive(Clone)]
 pub struct GlInteropContext;
 
@@ -35,6 +37,10 @@ impl MediaRuntime {
     pub fn record_presented(&mut self, _frame: &DecodedFrame) {}
 
     pub fn report_stream_stats(&mut self, _session: &Session) {}
+
+    pub fn diagnostics(&self) -> StreamDiagnostics {
+        StreamDiagnostics::default()
+    }
 
     pub fn poll_error(&self) -> Option<String> {
         None

@@ -24,6 +24,8 @@ use artemis_moonlight::{
     AudioEventReceiver, NetworkStats, Session, StreamEvent, VideoEventReceiver,
 };
 
+use super::StreamDiagnostics;
+
 type EglGetCurrentDisplay = unsafe extern "C" fn() -> *mut c_void;
 
 pub struct DecodedFrame {
@@ -252,6 +254,7 @@ pub struct MediaRuntime {
     last_video_report: VideoStats,
     last_ingress_report: artemis_moonlight::MediaIngressStats,
     last_network_report: NetworkStats,
+    diagnostics: StreamDiagnostics,
 }
 
 impl MediaRuntime {
@@ -261,6 +264,8 @@ impl MediaRuntime {
         gl_interop: Option<GlInteropContext>,
     ) -> Result<Self, String> {
         gst::init().map_err(|error| error.to_string())?;
+        let hardware_decode = gst::ElementFactory::find("vah264dec").is_some();
+        let zero_copy = hardware_decode && gl_interop.is_some();
         let clock_origin = Instant::now();
         let (frame_sender, frames) = bounded(2);
         let video_counters = Arc::new(VideoCounters::default());
@@ -286,6 +291,19 @@ impl MediaRuntime {
             last_video_report: VideoStats::default(),
             last_ingress_report: artemis_moonlight::MediaIngressStats::default(),
             last_network_report: NetworkStats::default(),
+            diagnostics: StreamDiagnostics {
+                decoder: if hardware_decode {
+                    "VA-API H.264 (vah264dec)"
+                } else {
+                    "Software H.264 (avdec_h264)"
+                },
+                memory_path: if zero_copy {
+                    "DMABUF to GL texture"
+                } else {
+                    "System memory"
+                },
+                ..StreamDiagnostics::default()
+            },
         })
     }
 
@@ -352,8 +370,46 @@ impl MediaRuntime {
             u64::from(self.last_network_report.audio_packets),
             seconds,
         );
+        let video_mbps = megabits_per_second(
+            ingress.video_bytes,
+            self.last_ingress_report.video_bytes,
+            seconds,
+        );
+        let audio_kbps = kilobits_per_second(
+            ingress.audio_bytes,
+            self.last_ingress_report.audio_bytes,
+            seconds,
+        );
+        let video_packet_issues = video_packet_issues(&network)
+            .saturating_sub(video_packet_issues(&self.last_network_report));
+        let audio_packet_issues = audio_packet_issues(&network)
+            .saturating_sub(audio_packet_issues(&self.last_network_report));
+        let video_fec_recovered = u64::from(network.video_fec_recovered)
+            .saturating_sub(u64::from(self.last_network_report.video_fec_recovered));
+        let audio_fec_recovered = u64::from(network.audio_fec_recovered)
+            .saturating_sub(u64::from(self.last_network_report.audio_fec_recovered));
         let video_clock = self.video_clock();
         let audio_clock = audio_clock(self.audio_counters.snapshot());
+        self.diagnostics = StreamDiagnostics {
+            video_ingress_fps,
+            decoded_fps,
+            presented_fps,
+            decoder_queue_dropped: dropped,
+            callback_queue_dropped,
+            video_mbps,
+            audio_kbps,
+            audio_ingress_pps,
+            video_network_pps,
+            audio_network_pps,
+            video_packet_issues,
+            audio_packet_issues,
+            video_fec_recovered,
+            audio_fec_recovered,
+            video_clock_drift_ms: video_clock.map(|clock| clock.drift),
+            audio_clock_drift_ms: audio_clock.map(|clock| clock.drift),
+            decoder: self.diagnostics.decoder,
+            memory_path: self.diagnostics.memory_path,
+        };
         tracing::info!(
             target: "artemis::media",
             video_ingress_fps,
@@ -363,8 +419,14 @@ impl MediaRuntime {
             decoder_queue_dropped = dropped,
             callback_queue_dropped,
             audio_ingress_pps,
+            video_mbps,
+            audio_kbps,
             video_network_pps,
             audio_network_pps,
+            video_packet_issues,
+            audio_packet_issues,
+            video_fec_recovered,
+            audio_fec_recovered,
             video_media_elapsed_ms = ?video_clock.map(|clock| clock.media_elapsed),
             video_wall_elapsed_ms = ?video_clock.map(|clock| clock.wall_elapsed),
             video_clock_drift_ms = ?video_clock.map(|clock| clock.drift),
@@ -378,6 +440,10 @@ impl MediaRuntime {
         self.last_ingress_report = ingress;
         self.last_network_report = network;
         self.last_video_report_at = now;
+    }
+
+    pub fn diagnostics(&self) -> StreamDiagnostics {
+        self.diagnostics
     }
 
     fn video_clock(&self) -> Option<PlaybackClock> {
@@ -717,6 +783,31 @@ fn signed_difference_millis(left_us: u64, right_us: u64) -> i64 {
 fn rate_per_second(current: u64, previous: u64, seconds: f64) -> f64 {
     let frames = u32::try_from(current.saturating_sub(previous)).unwrap_or(u32::MAX);
     f64::from(frames) / seconds
+}
+
+fn megabits_per_second(current: u64, previous: u64, seconds: f64) -> f64 {
+    bytes_per_second(current, previous, seconds) * 8.0 / 1_000_000.0
+}
+
+fn kilobits_per_second(current: u64, previous: u64, seconds: f64) -> f64 {
+    bytes_per_second(current, previous, seconds) * 8.0 / 1_000.0
+}
+
+fn bytes_per_second(current: u64, previous: u64, seconds: f64) -> f64 {
+    let bytes = u32::try_from(current.saturating_sub(previous)).unwrap_or(u32::MAX);
+    f64::from(bytes) / seconds
+}
+
+fn video_packet_issues(stats: &NetworkStats) -> u64 {
+    u64::from(stats.video_fec_failed)
+        .saturating_add(u64::from(stats.video_out_of_sequence))
+        .saturating_add(u64::from(stats.video_invalid))
+}
+
+fn audio_packet_issues(stats: &NetworkStats) -> u64 {
+    u64::from(stats.audio_fec_failed)
+        .saturating_add(u64::from(stats.audio_out_of_sequence))
+        .saturating_add(u64::from(stats.audio_invalid))
 }
 
 impl Drop for VideoPipeline {
@@ -1273,8 +1364,10 @@ mod tests {
 
     use super::{
         AudioOutput, AudioStats, AudioTimeline, PipeWirePlayer, PlaybackClock, audio_clock,
-        audio_pipeline_description, video_decoder_chain, video_pipeline_description,
+        audio_pipeline_description, megabits_per_second, video_decoder_chain, video_packet_issues,
+        video_pipeline_description,
     };
+    use artemis_moonlight::NetworkStats;
     use gstreamer as gst;
 
     #[test]
@@ -1324,6 +1417,24 @@ mod tests {
         assert_eq!(clock.media_elapsed, 1_000);
         assert_eq!(clock.wall_elapsed, 1_000);
         assert_eq!(clock.drift, 0);
+    }
+
+    #[test]
+    fn encoded_video_bandwidth_uses_decimal_megabits() {
+        assert!((megabits_per_second(12_500_000, 0, 1.0) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn video_packet_issues_exclude_successfully_recovered_fec() {
+        let stats = NetworkStats {
+            video_fec_recovered: 12,
+            video_fec_failed: 3,
+            video_out_of_sequence: 2,
+            video_invalid: 1,
+            ..NetworkStats::default()
+        };
+
+        assert_eq!(video_packet_issues(&stats), 6);
     }
 
     #[test]

@@ -46,7 +46,9 @@ pub struct NetworkStats {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MediaIngressStats {
     pub audio_packets: u64,
+    pub audio_bytes: u64,
     pub video_frames: u64,
+    pub video_bytes: u64,
     pub video_queue_dropped: u64,
 }
 

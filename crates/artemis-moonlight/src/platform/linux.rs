@@ -121,7 +121,9 @@ struct CallbackContext {
     audio: Sender<StreamEvent>,
     video: Sender<StreamEvent>,
     audio_packets: AtomicU64,
+    audio_bytes: AtomicU64,
     video_frames: AtomicU64,
+    video_bytes: AtomicU64,
     video_queue_dropped: AtomicU64,
 }
 
@@ -129,13 +131,21 @@ impl CallbackContext {
     fn media_ingress_stats(&self) -> MediaIngressStats {
         MediaIngressStats {
             audio_packets: self.audio_packets.load(Ordering::Relaxed),
+            audio_bytes: self.audio_bytes.load(Ordering::Relaxed),
             video_frames: self.video_frames.load(Ordering::Relaxed),
+            video_bytes: self.video_bytes.load(Ordering::Relaxed),
             video_queue_dropped: self.video_queue_dropped.load(Ordering::Relaxed),
         }
     }
 
     fn send_video(&self, event: StreamEvent) {
         self.video_frames.fetch_add(1, Ordering::Relaxed);
+        if let StreamEvent::VideoFrame { bytes, .. } = &event {
+            self.video_bytes.fetch_add(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         if matches!(self.video.try_send(event), Err(TrySendError::Full(_))) {
             self.video_queue_dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -143,6 +153,12 @@ impl CallbackContext {
 
     fn send_audio(&self, event: StreamEvent) {
         self.audio_packets.fetch_add(1, Ordering::Relaxed);
+        if let StreamEvent::AudioPacket(packet) = &event {
+            self.audio_bytes.fetch_add(
+                u64::try_from(packet.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         let _ = self.audio.send(event);
     }
 }
@@ -225,7 +241,9 @@ impl Session {
             audio: audio_sender,
             video: video_sender,
             audio_packets: AtomicU64::new(0),
+            audio_bytes: AtomicU64::new(0),
             video_frames: AtomicU64::new(0),
+            video_bytes: AtomicU64::new(0),
             video_queue_dropped: AtomicU64::new(0),
         });
         let callback_context =
@@ -587,27 +605,31 @@ mod tests {
             audio,
             video,
             audio_packets: AtomicU64::new(0),
+            audio_bytes: AtomicU64::new(0),
             video_frames: AtomicU64::new(0),
+            video_bytes: AtomicU64::new(0),
             video_queue_dropped: AtomicU64::new(0),
         };
 
         context.send_video(StreamEvent::VideoFrame {
-            bytes: vec![1],
+            bytes: vec![1, 2],
             key_frame: true,
             presentation_time_us: 1,
         });
         context.send_video(StreamEvent::VideoFrame {
-            bytes: vec![2],
+            bytes: vec![3, 4, 5],
             key_frame: false,
             presentation_time_us: 2,
         });
-        context.send_audio(StreamEvent::AudioPacket(vec![3]));
+        context.send_audio(StreamEvent::AudioPacket(vec![6, 7, 8, 9]));
 
         assert_eq!(
             context.media_ingress_stats(),
             crate::MediaIngressStats {
                 audio_packets: 1,
+                audio_bytes: 4,
                 video_frames: 2,
+                video_bytes: 5,
                 video_queue_dropped: 1,
             }
         );

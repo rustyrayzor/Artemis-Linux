@@ -12,7 +12,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::controller::ControllerManager;
 use crate::input::InputRouter;
-use crate::media::{DecodedFrame, GlInteropContext, MediaRuntime};
+use crate::media::{DecodedFrame, GlInteropContext, MediaRuntime, StreamDiagnostics};
 use crate::video_texture::StreamTexture;
 
 const DEFAULT_HTTP_PORT: u16 = 47_989;
@@ -45,6 +45,7 @@ pub struct ArtemisApp {
     stream_preset: StreamPreset,
     stream_bitrate: StreamBitrate,
     fullscreen: bool,
+    diagnostics_overlay: bool,
     pending_autostart: Option<AutostartRequest>,
     fullscreen_on_connect: bool,
     autostop_after_connect: Option<Duration>,
@@ -61,6 +62,7 @@ struct ActiveStream {
     app_title: String,
     profile_label: String,
     connected: bool,
+    connection_quality: ConnectionQuality,
 }
 
 #[derive(Debug)]
@@ -165,6 +167,7 @@ impl ArtemisApp {
             stream_preset,
             stream_bitrate,
             fullscreen: false,
+            diagnostics_overlay: false,
             pending_autostart,
             fullscreen_on_connect: false,
             autostop_after_connect: None,
@@ -510,6 +513,7 @@ impl ArtemisApp {
                                         app_title: title,
                                         profile_label,
                                         connected: false,
+                                        connection_quality: ConnectionQuality::Okay,
                                     });
                                     if self.fullscreen_on_connect {
                                         self.set_fullscreen(context, true);
@@ -545,7 +549,12 @@ impl ArtemisApp {
         }
     }
 
-    fn pump_stream(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+    fn pump_stream(
+        &mut self,
+        context: &egui::Context,
+        frame: &mut eframe::Frame,
+        suppress_escape: bool,
+    ) {
         let mut events = Vec::new();
         if let Some(active) = &self.active_stream {
             while let Ok(event) = active.events.try_recv() {
@@ -579,12 +588,14 @@ impl ArtemisApp {
                     );
                 }
                 StreamEvent::ConnectionStatus(ConnectionQuality::Okay) => {
+                    active.connection_quality = ConnectionQuality::Okay;
                     self.status = format!(
                         "Streaming {} at {}.",
                         active.app_title, active.profile_label
                     );
                 }
                 StreamEvent::ConnectionStatus(ConnectionQuality::Poor) => {
+                    active.connection_quality = ConnectionQuality::Poor;
                     "The stream connection is unstable.".clone_into(&mut self.status);
                 }
                 StreamEvent::Terminated(error) => terminated = Some(error),
@@ -608,7 +619,9 @@ impl ArtemisApp {
         if let Some(active) = &mut self.active_stream {
             active.controller.poll(&mut active.session);
             if active.connected {
-                active.input.forward(context, &mut active.session);
+                active
+                    .input
+                    .forward(context, &mut active.session, suppress_escape);
             }
         }
         let decoded_frame = self
@@ -652,19 +665,24 @@ impl ArtemisApp {
         Ok(())
     }
 
-    fn handle_stream_shortcuts(&mut self, context: &egui::Context) {
+    fn handle_stream_shortcuts(&mut self, context: &egui::Context) -> bool {
         if self.active_stream.is_none() {
-            return;
+            return false;
         }
         if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
             self.set_fullscreen(context, !self.fullscreen);
+        }
+        if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F10)) {
+            self.diagnostics_overlay = !self.diagnostics_overlay;
         }
         if self.fullscreen
             && context
                 .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.set_fullscreen(context, false);
+            return true;
         }
+        false
     }
 
     fn set_fullscreen(&mut self, context: &egui::Context, fullscreen: bool) {
@@ -865,6 +883,11 @@ impl ArtemisApp {
                     .small()
                     .color(Color32::from_rgb(120, 119, 116)),
                 );
+                ui.checkbox(
+                    &mut self.diagnostics_overlay,
+                    "Show performance diagnostics while streaming",
+                )
+                .on_hover_text("Toggle during a stream with F10");
                 ui.add_space(24.0);
                 section_label(ui, "APPLICATIONS");
                 ui.add_space(8.0);
@@ -921,6 +944,17 @@ impl ArtemisApp {
                         if ui.button("Fullscreen").clicked() {
                             self.set_fullscreen(context, true);
                         }
+                        if ui
+                            .button(if self.diagnostics_overlay {
+                                "Hide diagnostics"
+                            } else {
+                                "Diagnostics"
+                            })
+                            .on_hover_text("Toggle performance diagnostics (F10)")
+                            .clicked()
+                        {
+                            self.diagnostics_overlay = !self.diagnostics_overlay;
+                        }
                     });
                 });
             });
@@ -944,14 +978,97 @@ impl ArtemisApp {
                     });
                 }
             });
+        if self.diagnostics_overlay {
+            self.performance_overlay(context);
+        }
     }
+
+    fn performance_overlay(&self, context: &egui::Context) {
+        let Some(active) = &self.active_stream else {
+            return;
+        };
+        let diagnostics = active.media.diagnostics();
+        let top_offset = if self.fullscreen { 12.0 } else { 56.0 };
+        egui::Area::new(egui::Id::new("performance_diagnostics"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, top_offset))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(context, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_black_alpha(190))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_min_width(360.0);
+                        ui.label(
+                            RichText::new("PERFORMANCE DIAGNOSTICS  ·  F10")
+                                .monospace()
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.label(
+                            RichText::new(overlay_text(
+                                &active.profile_label,
+                                active.connection_quality,
+                                diagnostics,
+                            ))
+                            .monospace()
+                            .size(12.0)
+                            .color(Color32::WHITE),
+                        );
+                    });
+            });
+    }
+}
+
+fn overlay_text(
+    profile_label: &str,
+    connection_quality: ConnectionQuality,
+    diagnostics: StreamDiagnostics,
+) -> String {
+    let quality = match connection_quality {
+        ConnectionQuality::Okay => "Good",
+        ConnectionQuality::Poor => "Poor",
+    };
+    let video_drift = diagnostics
+        .video_clock_drift_ms
+        .map_or_else(|| "—".to_owned(), |value| format!("{value:+} ms"));
+    let audio_drift = diagnostics
+        .audio_clock_drift_ms
+        .map_or_else(|| "—".to_owned(), |value| format!("{value:+} ms"));
+    format!(
+        "\nStream    {profile_label} · Connection {quality}\n\
+         Decoder   {} · {}\n\
+         Video     In {:>5.1} · Decode {:>5.1} · Present {:>5.1} FPS\n\
+         Drops     Decode queue {} · Callback queue {} /s\n\
+         Network   {:>6.1} Mbps · {:>6.0} video packets/s\n\
+         Issues    Video {} · recovered {} /s\n\
+         Audio     {:>5.0} packets/s · {:>5.0} Kbps\n\
+         Issues    Audio {} · recovered {} /s\n\
+         Clocks    Video {video_drift} · Audio {audio_drift}",
+        diagnostics.decoder,
+        diagnostics.memory_path,
+        diagnostics.video_ingress_fps,
+        diagnostics.decoded_fps,
+        diagnostics.presented_fps,
+        diagnostics.decoder_queue_dropped,
+        diagnostics.callback_queue_dropped,
+        diagnostics.video_mbps,
+        diagnostics.video_network_pps,
+        diagnostics.video_packet_issues,
+        diagnostics.video_fec_recovered,
+        diagnostics.audio_ingress_pps,
+        diagnostics.audio_kbps,
+        diagnostics.audio_packet_issues,
+        diagnostics.audio_fec_recovered,
+    )
 }
 
 impl eframe::App for ArtemisApp {
     fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
         self.drain_tasks(context);
-        self.handle_stream_shortcuts(context);
-        self.pump_stream(context, frame);
+        let suppress_escape = self.handle_stream_shortcuts(context);
+        self.pump_stream(context, frame, suppress_escape);
 
         if !self.fullscreen {
             egui::TopBottomPanel::bottom("status")
@@ -1135,8 +1252,10 @@ mod tests {
     use std::time::Duration;
 
     use artemis_core::StreamPreset;
+    use artemis_moonlight::ConnectionQuality;
 
-    use super::{AUTOSTART_APP_ENV, autostart_from_values, parse_manual_host};
+    use super::{AUTOSTART_APP_ENV, autostart_from_values, overlay_text, parse_manual_host};
+    use crate::media::StreamDiagnostics;
 
     #[test]
     fn parses_default_and_explicit_ports() {
@@ -1186,5 +1305,29 @@ mod tests {
         .expect_err("incomplete configuration");
 
         assert!(error.contains(AUTOSTART_APP_ENV));
+    }
+
+    #[test]
+    fn performance_overlay_labels_measured_linux_stream_metrics() {
+        let text = overlay_text(
+            "3840x2160 at 60 FPS · 100 Mbps",
+            ConnectionQuality::Okay,
+            StreamDiagnostics {
+                video_ingress_fps: 60.0,
+                decoded_fps: 59.8,
+                presented_fps: 58.9,
+                video_mbps: 96.4,
+                audio_ingress_pps: 200.0,
+                decoder: "VA-API H.264 (vah264dec)",
+                memory_path: "DMABUF to GL texture",
+                ..StreamDiagnostics::default()
+            },
+        );
+
+        assert!(text.contains("3840x2160 at 60 FPS · 100 Mbps"));
+        assert!(text.contains("VA-API H.264 (vah264dec)"));
+        assert!(text.contains("Present  58.9 FPS"));
+        assert!(text.contains("96.4 Mbps"));
+        assert!(text.contains("200 packets/s"));
     }
 }

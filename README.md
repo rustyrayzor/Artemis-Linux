@@ -15,6 +15,9 @@ The first supported vertical slice includes:
 - keyboard, relative mouse, wheel, and one game controller;
 - borderless, edge-to-edge fullscreen presentation with an on-screen control,
   F11 toggle, and Escape-to-exit behavior;
+- a toggleable in-stream performance overlay with F10 access, encoded
+  bandwidth, receive/decode/presentation rates, queue drops, packet health,
+  decoder path, and video/audio clock drift;
 - disconnect, host application cancellation, and RAII cleanup.
 
 The Rust control plane owns discovery, pairing, XML/HTTP, launch, and lifecycle.

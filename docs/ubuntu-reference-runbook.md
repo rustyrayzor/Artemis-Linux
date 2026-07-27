@@ -53,10 +53,14 @@ RUST_LOG=artemis=debug ./target/release/artemis-linux
 7. Enter fullscreen using the on-screen control, exit with Escape, then toggle
    fullscreen on and off with F11. Confirm the video is edge-to-edge with no
    desktop panel, window decoration, application controls, or status border.
-8. Confirm keyboard press/release, relative mouse movement/buttons/wheel, and
+8. Enable Show performance diagnostics before streaming or press F10 during a
+   stream. Confirm the overlay remains visible in fullscreen and updates its
+   incoming, decoded, presented, bandwidth, drop, packet-health, and clock
+   values about once per second. Press F10 again to hide it.
+9. Confirm keyboard press/release, relative mouse movement/buttons/wheel, and
    one connected controller.
-9. Disconnect and verify the local stream exits without hanging.
-10. Reconnect with Resume, then use End host app and verify `/cancel`.
+10. Disconnect and verify the local stream exits without hanging.
+11. Reconnect with Resume, then use End host app and verify `/cancel`.
 
 For unattended beta diagnostics, the same launch path can be exercised without
 changing normal UI startup:
