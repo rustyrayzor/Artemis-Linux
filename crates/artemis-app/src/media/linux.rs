@@ -153,8 +153,8 @@ impl VideoWorker {
                     &events,
                     &stop_receiver,
                     &error_sender,
-                    frames,
-                    video_counters,
+                    &frames,
+                    &video_counters,
                 );
             })
             .map_err(|error| error.to_string())?;
@@ -188,8 +188,8 @@ fn run_video_worker(
     events: &VideoEventReceiver,
     stop: &Receiver<()>,
     errors: &Sender<String>,
-    frames: crossbeam_channel::Sender<DecodedFrame>,
-    video_counters: Arc<VideoCounters>,
+    frames: &crossbeam_channel::Sender<DecodedFrame>,
+    video_counters: &Arc<VideoCounters>,
 ) {
     let mut video = None;
     loop {
