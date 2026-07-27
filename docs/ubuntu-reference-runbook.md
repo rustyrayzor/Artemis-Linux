@@ -49,10 +49,12 @@ RUST_LOG=artemis=debug ./target/release/artemis-linux
    2560x1440 at 60 FPS. Repeat at 4K60 and verify 3840x2160 at 60 FPS.
 6. Confirm the local presentation remains scaled to fit the Artemis window at
    each resolution.
-7. Confirm keyboard press/release, relative mouse movement/buttons/wheel, and
+7. Enter fullscreen using the on-screen control, exit with Escape, then toggle
+   fullscreen on and off with F11.
+8. Confirm keyboard press/release, relative mouse movement/buttons/wheel, and
    one connected controller.
-8. Disconnect and verify the local stream exits without hanging.
-9. Reconnect with Resume, then use End host app and verify `/cancel`.
+9. Disconnect and verify the local stream exits without hanging.
+10. Reconnect with Resume, then use End host app and verify `/cancel`.
 
 Capture `RUST_LOG=artemis=debug` output for any failure. Never include private
 keys or certificate contents in a diagnostic bundle.

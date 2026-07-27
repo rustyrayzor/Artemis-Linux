@@ -35,6 +35,7 @@ pub struct ArtemisApp {
     active_stream: Option<ActiveStream>,
     texture: Option<TextureHandle>,
     stream_preset: StreamPreset,
+    fullscreen: bool,
 }
 
 struct ActiveStream {
@@ -100,6 +101,7 @@ impl ArtemisApp {
             active_stream: None,
             texture: None,
             stream_preset: StreamPreset::default(),
+            fullscreen: false,
         };
         app.start_discovery();
         app
@@ -493,6 +495,26 @@ impl ArtemisApp {
         }
     }
 
+    fn handle_stream_shortcuts(&mut self, context: &egui::Context) {
+        if self.active_stream.is_none() {
+            return;
+        }
+        if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            self.set_fullscreen(context, !self.fullscreen);
+        }
+        if self.fullscreen
+            && context
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.set_fullscreen(context, false);
+        }
+    }
+
+    fn set_fullscreen(&mut self, context: &egui::Context, fullscreen: bool) {
+        self.fullscreen = fullscreen;
+        context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+    }
+
     fn disconnect(&mut self, context: &egui::Context, cancel_host: bool) {
         let Some(mut active) = self.active_stream.take() else {
             return;
@@ -502,6 +524,7 @@ impl ArtemisApp {
         active.media.shutdown();
         active.session.stop();
         self.texture = None;
+        self.set_fullscreen(context, false);
         context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
         context.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
         self.status = format!("Disconnected from {}.", active.app_title);
@@ -718,6 +741,14 @@ impl ArtemisApp {
                     if ui.button("Disconnect").clicked() {
                         self.disconnect(context, false);
                     }
+                    let fullscreen_label = if self.fullscreen {
+                        "Exit fullscreen"
+                    } else {
+                        "Fullscreen"
+                    };
+                    if ui.button(fullscreen_label).clicked() {
+                        self.set_fullscreen(context, !self.fullscreen);
+                    }
                 });
             });
         });
@@ -746,6 +777,7 @@ impl ArtemisApp {
 impl eframe::App for ArtemisApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_tasks(context);
+        self.handle_stream_shortcuts(context);
         self.pump_stream(context);
 
         egui::TopBottomPanel::bottom("status")
