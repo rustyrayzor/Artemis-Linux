@@ -142,14 +142,14 @@ impl StreamTexture {
             let chroma = frame
                 .plane_data(1)
                 .map_err(|error| format!("could not map decoded chroma plane: {error}"))?;
-            return self.upload_nv12_planes(
+            self.upload_nv12_planes(
                 decoded.width,
                 decoded.height,
                 luma,
                 luma_stride,
                 chroma,
                 chroma_stride,
-            );
+            )
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -202,11 +202,11 @@ impl StreamTexture {
             .map_err(|_| "decoded luma stride is too large for OpenGL".to_owned())?;
         let chroma_row_length = i32::try_from(chroma_stride / 2)
             .map_err(|_| "decoded chroma stride is too large for OpenGL".to_owned())?;
-        let pixel_buffer_bytes = i32::try_from(layout.total_bytes)
+        let pixel_buffer_bytes = i32::try_from(layout.total)
             .map_err(|_| "decoded video buffer is too large for OpenGL".to_owned())?;
-        let chroma_offset = i32::try_from(layout.luma_bytes)
+        let chroma_offset = i32::try_from(layout.luma_span)
             .map_err(|_| "decoded video buffer is too large for OpenGL".to_owned())?;
-        let chroma_upload_offset = u32::try_from(layout.luma_bytes)
+        let chroma_upload_offset = u32::try_from(layout.luma_span)
             .map_err(|_| "decoded video buffer is too large for OpenGL".to_owned())?;
         let allocate = self.size != [decoded_width, decoded_height];
         let pixel_buffer = self.pixel_buffers[self.next_pixel_buffer];
@@ -237,12 +237,12 @@ impl StreamTexture {
             self.gl.buffer_sub_data_u8_slice(
                 glow::PIXEL_UNPACK_BUFFER,
                 0,
-                &luma[..layout.luma_bytes],
+                &luma[..layout.luma_span],
             );
             self.gl.buffer_sub_data_u8_slice(
                 glow::PIXEL_UNPACK_BUFFER,
                 chroma_offset,
-                &chroma[..layout.chroma_bytes],
+                &chroma[..layout.chroma_span],
             );
             self.gl
                 .pixel_store_i32(glow::UNPACK_ROW_LENGTH, luma_row_length);
@@ -605,9 +605,9 @@ fn expected_nv12_bytes(width: usize, height: usize) -> Result<usize, String> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Nv12UploadLayout {
-    luma_bytes: usize,
-    chroma_bytes: usize,
-    total_bytes: usize,
+    luma_span: usize,
+    chroma_span: usize,
+    total: usize,
 }
 
 fn nv12_upload_layout(
@@ -644,9 +644,9 @@ fn nv12_upload_layout(
         .checked_add(chroma_bytes)
         .ok_or_else(|| "decoded video buffer size overflowed".to_owned())?;
     Ok(Nv12UploadLayout {
-        luma_bytes,
-        chroma_bytes,
-        total_bytes,
+        luma_span: luma_bytes,
+        chroma_span: chroma_bytes,
+        total: total_bytes,
     })
 }
 
@@ -695,9 +695,9 @@ mod tests {
         assert_eq!(
             nv12_upload_layout(4, 4, 28, 8, 12, 8),
             Ok(Nv12UploadLayout {
-                luma_bytes: 28,
-                chroma_bytes: 12,
-                total_bytes: 40,
+                luma_span: 28,
+                chroma_span: 12,
+                total: 40,
             })
         );
     }
