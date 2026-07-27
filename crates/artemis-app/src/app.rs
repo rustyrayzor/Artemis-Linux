@@ -972,7 +972,7 @@ impl eframe::App for ArtemisApp {
 
         if self.active_stream.is_some() {
             self.stream_ui(context);
-            context.request_repaint_after(Duration::from_millis(16));
+            context.request_repaint();
         } else {
             self.browser_ui(context);
         }
