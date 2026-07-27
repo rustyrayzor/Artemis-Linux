@@ -92,25 +92,37 @@ impl GlInteropContext {
             .bus()
             .ok_or_else(|| "video pipeline has no message bus".to_owned())?;
         bus.set_sync_handler(move |_, message| {
-            let gst::MessageView::NeedContext(needed) = message.view() else {
-                return gst::BusSyncReply::Pass;
-            };
-            let Some(element) = message
-                .src()
-                .and_then(|source| source.downcast_ref::<gst::Element>())
-            else {
-                return gst::BusSyncReply::Pass;
-            };
-            if needed.context_type() == gst_gl::GL_DISPLAY_CONTEXT_TYPE.as_str() {
-                element.set_context(&gl_display_context(&display));
-            } else if needed.context_type() == "gst.gl.app_context"
-                && let Ok(app_context) = gl_app_context(&context)
-            {
-                element.set_context(&app_context);
-            }
+            provide_gl_context(message, &display, &context);
             gst::BusSyncReply::Pass
         });
         Ok(())
+    }
+}
+
+fn provide_gl_context(
+    message: &gst::Message,
+    display: &gst_gl::GLDisplay,
+    context: &gst_gl::GLContext,
+) {
+    let gst::MessageView::NeedContext(needed) = message.view() else {
+        return;
+    };
+    let Some(element) = message
+        .src()
+        .and_then(|source| source.downcast_ref::<gst::Element>())
+    else {
+        return;
+    };
+    match needed.context_type() {
+        context_type if context_type == gst_gl::GL_DISPLAY_CONTEXT_TYPE.as_str() => {
+            element.set_context(&gl_display_context(display));
+        }
+        "gst.gl.app_context" => {
+            if let Ok(app_context) = gl_app_context(context) {
+                element.set_context(&app_context);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -576,13 +588,8 @@ impl VideoPipeline {
                         usize::try_from(info.height()).map_err(|_| gst::FlowError::Error)?;
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let presentation_time_us = buffer.pts().map_or(0, gst::ClockTime::useconds);
-                    if info.format() == gst_video::VideoFormat::Rgba
-                        && let (Some(sync), Some(producer)) =
-                            (buffer.meta::<gst_gl::GLSyncMeta>(), gl_producer.as_ref())
-                        && let Some(producer_context) =
-                            producer.property::<Option<gst_gl::GLContext>>("context")
-                    {
-                        sync.set_sync_point(&producer_context);
+                    if info.format() == gst_video::VideoFormat::Rgba {
+                        set_gl_sync_point(buffer, gl_producer.as_ref());
                     }
                     let frame = DecodedFrame {
                         width,
@@ -627,6 +634,16 @@ impl VideoPipeline {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+}
+
+fn set_gl_sync_point(buffer: &gst::BufferRef, producer: Option<&gst::Element>) {
+    let (Some(sync), Some(producer)) = (buffer.meta::<gst_gl::GLSyncMeta>(), producer) else {
+        return;
+    };
+    let Some(producer_context) = producer.property::<Option<gst_gl::GLContext>>("context") else {
+        return;
+    };
+    sync.set_sync_point(&producer_context);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

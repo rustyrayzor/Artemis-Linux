@@ -5,8 +5,6 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::glow::{self, HasContext};
 #[cfg(target_os = "linux")]
-use gstreamer as gst;
-#[cfg(target_os = "linux")]
 use gstreamer_gl as gst_gl;
 #[cfg(target_os = "linux")]
 use gstreamer_gl::GLVideoFrameExt;
