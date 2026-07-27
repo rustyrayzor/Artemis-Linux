@@ -4,6 +4,10 @@ use std::sync::Arc;
 
 use eframe::egui;
 use eframe::glow::{self, HasContext};
+#[cfg(target_os = "linux")]
+use gstreamer_video as gst_video;
+#[cfg(target_os = "linux")]
+use gstreamer_video::VideoFrameExt;
 
 use crate::media::DecodedFrame;
 
@@ -97,29 +101,119 @@ impl StreamTexture {
     }
 
     pub fn upload(&mut self, decoded: &DecodedFrame) -> Result<(), String> {
-        let expected_bytes = expected_nv12_bytes(decoded.width, decoded.height)?;
-        if decoded.nv12.len() != expected_bytes {
-            return Err(format!(
-                "decoded NV12 buffer has {} bytes; expected {expected_bytes}",
-                decoded.nv12.len()
-            ));
+        #[cfg(target_os = "linux")]
+        {
+            let caps = decoded
+                .sample
+                .caps()
+                .ok_or_else(|| "decoded video sample has no caps".to_owned())?;
+            let info = gst_video::VideoInfo::from_caps(caps)
+                .map_err(|error| format!("invalid decoded video caps: {error}"))?;
+            if info.format() != gst_video::VideoFormat::Nv12 {
+                return Err(format!(
+                    "decoded video format is {:?}; expected NV12",
+                    info.format()
+                ));
+            }
+            let width = usize::try_from(info.width())
+                .map_err(|_| "decoded video width is too large".to_owned())?;
+            let height = usize::try_from(info.height())
+                .map_err(|_| "decoded video height is too large".to_owned())?;
+            if [width, height] != [decoded.width, decoded.height] {
+                return Err(format!(
+                    "decoded video caps are {width}x{height}; expected {}x{}",
+                    decoded.width, decoded.height
+                ));
+            }
+            let buffer = decoded
+                .sample
+                .buffer()
+                .ok_or_else(|| "decoded video sample has no buffer".to_owned())?;
+            let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+                .map_err(|error| format!("could not map decoded video frame: {error}"))?;
+            let strides = frame.plane_stride();
+            let luma_stride = usize::try_from(strides[0])
+                .map_err(|_| "decoded luma stride is invalid".to_owned())?;
+            let chroma_stride = usize::try_from(strides[1])
+                .map_err(|_| "decoded chroma stride is invalid".to_owned())?;
+            let luma = frame
+                .plane_data(0)
+                .map_err(|error| format!("could not map decoded luma plane: {error}"))?;
+            let chroma = frame
+                .plane_data(1)
+                .map_err(|error| format!("could not map decoded chroma plane: {error}"))?;
+            return self.upload_nv12_planes(
+                decoded.width,
+                decoded.height,
+                luma,
+                luma_stride,
+                chroma,
+                chroma_stride,
+            );
         }
-        let width = i32::try_from(decoded.width)
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let expected_bytes = expected_nv12_bytes(decoded.width, decoded.height)?;
+            if decoded.nv12.len() != expected_bytes {
+                return Err(format!(
+                    "decoded NV12 buffer has {} bytes; expected {expected_bytes}",
+                    decoded.nv12.len()
+                ));
+            }
+            let luma_bytes = decoded
+                .width
+                .checked_mul(decoded.height)
+                .ok_or_else(|| "decoded video dimensions overflowed".to_owned())?;
+            self.upload_nv12_planes(
+                decoded.width,
+                decoded.height,
+                &decoded.nv12[..luma_bytes],
+                decoded.width,
+                &decoded.nv12[luma_bytes..],
+                decoded.width,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_nv12_planes(
+        &mut self,
+        decoded_width: usize,
+        decoded_height: usize,
+        luma: &[u8],
+        luma_stride: usize,
+        chroma: &[u8],
+        chroma_stride: usize,
+    ) -> Result<(), String> {
+        let layout = nv12_upload_layout(
+            decoded_width,
+            decoded_height,
+            luma.len(),
+            luma_stride,
+            chroma.len(),
+            chroma_stride,
+        )?;
+        let width = i32::try_from(decoded_width)
             .map_err(|_| "decoded video width is too large".to_owned())?;
-        let height = i32::try_from(decoded.height)
+        let height = i32::try_from(decoded_height)
             .map_err(|_| "decoded video height is too large".to_owned())?;
-        let luma_bytes = decoded
-            .width
-            .checked_mul(decoded.height)
-            .ok_or_else(|| "decoded video dimensions overflowed".to_owned())?;
-        let chroma_offset = u32::try_from(luma_bytes)
+        let luma_row_length = i32::try_from(luma_stride)
+            .map_err(|_| "decoded luma stride is too large for OpenGL".to_owned())?;
+        let chroma_row_length = i32::try_from(chroma_stride / 2)
+            .map_err(|_| "decoded chroma stride is too large for OpenGL".to_owned())?;
+        let pixel_buffer_bytes = i32::try_from(layout.total_bytes)
             .map_err(|_| "decoded video buffer is too large for OpenGL".to_owned())?;
-        let allocate = self.size != [decoded.width, decoded.height];
+        let chroma_offset = i32::try_from(layout.luma_bytes)
+            .map_err(|_| "decoded video buffer is too large for OpenGL".to_owned())?;
+        let chroma_upload_offset = u32::try_from(layout.luma_bytes)
+            .map_err(|_| "decoded video buffer is too large for OpenGL".to_owned())?;
+        let allocate = self.size != [decoded_width, decoded_height];
         let pixel_buffer = self.pixel_buffers[self.next_pixel_buffer];
 
-        // SAFETY: Every GL object belongs to the current eframe context. The validated NV12 slice
-        // is copied into an orphaned pixel buffer before two ordered texture uploads and the
-        // shader conversion are queued.
+        // SAFETY: Every GL object belongs to the current eframe context. The validated decoded
+        // planes are copied directly into an orphaned pixel buffer. UNPACK_ROW_LENGTH preserves
+        // hardware-decoder stride without repacking the full 4K frame in the GStreamer callback.
         unsafe {
             if allocate {
                 allocate_textures(
@@ -135,20 +229,35 @@ impl StreamTexture {
             self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
             self.gl
                 .bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pixel_buffer));
-            self.gl.buffer_data_u8_slice(
+            self.gl.buffer_data_size(
                 glow::PIXEL_UNPACK_BUFFER,
-                &decoded.nv12,
+                pixel_buffer_bytes,
                 glow::STREAM_DRAW,
             );
+            self.gl.buffer_sub_data_u8_slice(
+                glow::PIXEL_UNPACK_BUFFER,
+                0,
+                &luma[..layout.luma_bytes],
+            );
+            self.gl.buffer_sub_data_u8_slice(
+                glow::PIXEL_UNPACK_BUFFER,
+                chroma_offset,
+                &chroma[..layout.chroma_bytes],
+            );
+            self.gl
+                .pixel_store_i32(glow::UNPACK_ROW_LENGTH, luma_row_length);
             upload_plane(&self.gl, self.luma, width, height, glow::RED, 0);
+            self.gl
+                .pixel_store_i32(glow::UNPACK_ROW_LENGTH, chroma_row_length);
             upload_plane(
                 &self.gl,
                 self.chroma,
                 width / 2,
                 height / 2,
                 glow::RG,
-                chroma_offset,
+                chroma_upload_offset,
             );
+            self.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
             self.gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
             render_nv12(self, width, height);
             let error = self.gl.get_error();
@@ -158,7 +267,7 @@ impl StreamTexture {
         }
 
         self.next_pixel_buffer = (self.next_pixel_buffer + 1) % self.pixel_buffers.len();
-        self.size = [decoded.width, decoded.height];
+        self.size = [decoded_width, decoded_height];
         Ok(())
     }
 }
@@ -494,6 +603,53 @@ fn expected_nv12_bytes(width: usize, height: usize) -> Result<usize, String> {
         .ok_or_else(|| "decoded video dimensions overflowed".to_owned())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Nv12UploadLayout {
+    luma_bytes: usize,
+    chroma_bytes: usize,
+    total_bytes: usize,
+}
+
+fn nv12_upload_layout(
+    width: usize,
+    height: usize,
+    luma_len: usize,
+    luma_stride: usize,
+    chroma_len: usize,
+    chroma_stride: usize,
+) -> Result<Nv12UploadLayout, String> {
+    expected_nv12_bytes(width, height)?;
+    if luma_stride < width || chroma_stride < width {
+        return Err("decoded video plane stride is shorter than its visible width".to_owned());
+    }
+    if chroma_stride % 2 != 0 {
+        return Err("decoded chroma stride must contain whole RG pixels".to_owned());
+    }
+
+    let luma_bytes = luma_stride
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|bytes| bytes.checked_add(width))
+        .ok_or_else(|| "decoded luma plane dimensions overflowed".to_owned())?;
+    let chroma_height = height / 2;
+    let chroma_bytes = chroma_stride
+        .checked_mul(chroma_height.saturating_sub(1))
+        .and_then(|bytes| bytes.checked_add(width))
+        .ok_or_else(|| "decoded chroma plane dimensions overflowed".to_owned())?;
+    if luma_len < luma_bytes || chroma_len < chroma_bytes {
+        return Err(format!(
+            "decoded NV12 planes are too short: luma {luma_len}/{luma_bytes}, chroma {chroma_len}/{chroma_bytes}"
+        ));
+    }
+    let total_bytes = luma_bytes
+        .checked_add(chroma_bytes)
+        .ok_or_else(|| "decoded video buffer size overflowed".to_owned())?;
+    Ok(Nv12UploadLayout {
+        luma_bytes,
+        chroma_bytes,
+        total_bytes,
+    })
+}
+
 #[allow(unsafe_code)]
 unsafe fn delete_textures(gl: &glow::Context, textures: [glow::Texture; 3]) {
     unsafe {
@@ -521,7 +677,7 @@ unsafe fn delete_program_resources(
 
 #[cfg(test)]
 mod tests {
-    use super::expected_nv12_bytes;
+    use super::{Nv12UploadLayout, expected_nv12_bytes, nv12_upload_layout};
 
     #[test]
     fn nv12_size_is_one_and_a_half_bytes_per_pixel() {
@@ -532,5 +688,23 @@ mod tests {
     fn nv12_dimensions_must_be_even() {
         assert!(expected_nv12_bytes(1_919, 1_080).is_err());
         assert!(expected_nv12_bytes(1_920, 1_079).is_err());
+    }
+
+    #[test]
+    fn nv12_upload_layout_preserves_decoder_plane_stride() {
+        assert_eq!(
+            nv12_upload_layout(4, 4, 28, 8, 12, 8),
+            Ok(Nv12UploadLayout {
+                luma_bytes: 28,
+                chroma_bytes: 12,
+                total_bytes: 40,
+            })
+        );
+    }
+
+    #[test]
+    fn nv12_upload_layout_rejects_short_planes() {
+        assert!(nv12_upload_layout(4, 4, 27, 8, 12, 8).is_err());
+        assert!(nv12_upload_layout(4, 4, 28, 8, 11, 8).is_err());
     }
 }
