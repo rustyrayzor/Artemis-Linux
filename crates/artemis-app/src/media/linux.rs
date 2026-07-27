@@ -308,6 +308,10 @@ struct AudioTimeline {
     next_pts: Option<gst::ClockTime>,
 }
 
+const AUDIO_TARGET_LATENCY_NS: u64 = 50_000_000;
+const AUDIO_MIN_LATENCY_NS: u64 = 20_000_000;
+const AUDIO_MAX_BUFFER_NS: u64 = 100_000_000;
+
 impl AudioTimeline {
     fn new(sample_rate: i32, samples_per_frame: i32) -> Result<Self, String> {
         let sample_rate = u64::try_from(sample_rate)
@@ -330,7 +334,13 @@ impl AudioTimeline {
     }
 
     fn next(&mut self, start: gst::ClockTime) -> (gst::ClockTime, gst::ClockTime) {
-        let pts = self.next_pts.unwrap_or(start);
+        let minimum_pts = start.saturating_add(gst::ClockTime::from_nseconds(AUDIO_MIN_LATENCY_NS));
+        let target_pts =
+            start.saturating_add(gst::ClockTime::from_nseconds(AUDIO_TARGET_LATENCY_NS));
+        let pts = self
+            .next_pts
+            .filter(|next_pts| *next_pts >= minimum_pts)
+            .unwrap_or(target_pts);
         self.next_pts = Some(pts.saturating_add(self.frame_duration));
         (pts, self.frame_duration)
     }
@@ -426,13 +436,15 @@ fn audio_pipeline_description(sample_rate: i32, channels: i32, pipewire_availabl
     };
     format!(
         "appsrc name=audio_src is-live=true format=time do-timestamp=false \
+         block=true max-time={AUDIO_MAX_BUFFER_NS} \
          caps=audio/x-opus,rate={sample_rate},channels={channels},\
          channel-mapping-family=0 ! opusparse ! \
          opusdec plc=true use-inband-fec=true ! audioconvert ! \
          audioresample ! \
          audio/x-raw,format=F32LE,rate={sample_rate},channels={channels} ! \
          tee name=audio_tee \
-         audio_tee. ! queue ! {sink}"
+         audio_tee. ! queue max-size-buffers=0 max-size-bytes=0 \
+         max-size-time={AUDIO_MAX_BUFFER_NS} ! {sink}"
     )
 }
 
@@ -534,7 +546,7 @@ mod tests {
     use gstreamer as gst;
 
     #[test]
-    fn opus_timeline_preserves_five_millisecond_cadence_for_batched_packets() {
+    fn opus_timeline_preserves_cadence_with_playback_look_ahead() {
         let mut timeline = AudioTimeline::new(48_000, 240).expect("valid Opus timing");
         let start = gst::ClockTime::from_mseconds(500);
 
@@ -543,11 +555,25 @@ mod tests {
         assert_eq!(
             timestamps,
             [
-                gst::ClockTime::from_mseconds(500),
-                gst::ClockTime::from_mseconds(505),
-                gst::ClockTime::from_mseconds(510),
-                gst::ClockTime::from_mseconds(515),
+                gst::ClockTime::from_mseconds(550),
+                gst::ClockTime::from_mseconds(555),
+                gst::ClockTime::from_mseconds(560),
+                gst::ClockTime::from_mseconds(565),
             ]
+        );
+    }
+
+    #[test]
+    fn opus_timeline_rebuffers_after_starvation() {
+        let mut timeline = AudioTimeline::new(48_000, 240).expect("valid Opus timing");
+
+        assert_eq!(
+            timeline.next(gst::ClockTime::from_mseconds(500)).0,
+            gst::ClockTime::from_mseconds(550)
+        );
+        assert_eq!(
+            timeline.next(gst::ClockTime::from_mseconds(700)).0,
+            gst::ClockTime::from_mseconds(750)
         );
     }
 
@@ -562,7 +588,11 @@ mod tests {
         let description = audio_pipeline_description(48_000, 2, true);
 
         assert!(description.contains("audio/x-raw,format=F32LE,rate=48000,channels=2"));
-        assert!(description.contains("queue ! pipewiresink sync=true"));
+        assert!(description.contains("block=true max-time=100000000"));
+        assert!(description.contains(
+            "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 ! \
+             pipewiresink sync=true"
+        ));
         assert!(!description.contains("min-threshold-time"));
         assert!(!description.contains("pulsesink"));
     }
@@ -571,9 +601,10 @@ mod tests {
     fn clocked_pulse_sink_is_retained_as_a_plugin_fallback() {
         let description = audio_pipeline_description(48_000, 2, false);
 
-        assert!(
-            description.contains("queue ! pulsesink sync=true buffer-time=15000 latency-time=3750")
-        );
+        assert!(description.contains(
+            "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 ! \
+             pulsesink sync=true buffer-time=15000 latency-time=3750"
+        ));
         assert!(!description.contains("min-threshold-time"));
         assert!(!description.contains("pipewiresink"));
     }
