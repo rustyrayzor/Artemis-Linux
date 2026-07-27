@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use std::sync::Arc;
 
 use eframe::egui;
@@ -5,7 +7,7 @@ use eframe::glow::{self, HasContext};
 
 use crate::media::DecodedFrame;
 
-const VERTEX_SHADER: &str = r#"#version 330 core
+const VERTEX_SHADER: &str = r"#version 330 core
 out vec2 texture_coordinate;
 
 void main() {
@@ -18,9 +20,9 @@ void main() {
     texture_coordinate = position * 0.5 + 0.5;
     gl_Position = vec4(position, 0.0, 1.0);
 }
-"#;
+";
 
-const FRAGMENT_SHADER: &str = r#"#version 330 core
+const FRAGMENT_SHADER: &str = r"#version 330 core
 in vec2 texture_coordinate;
 out vec4 output_color;
 
@@ -38,7 +40,7 @@ void main() {
     );
     output_color = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }
-"#;
+";
 
 pub struct StreamTexture {
     gl: Arc<glow::Context>,
@@ -110,7 +112,7 @@ impl StreamTexture {
             .width
             .checked_mul(decoded.height)
             .ok_or_else(|| "decoded video dimensions overflowed".to_owned())?;
-        let chroma_offset = i32::try_from(luma_bytes)
+        let chroma_offset = u32::try_from(luma_bytes)
             .map_err(|_| "decoded video buffer is too large for OpenGL".to_owned())?;
         let allocate = self.size != [decoded.width, decoded.height];
         let pixel_buffer = self.pixel_buffers[self.next_pixel_buffer];
@@ -424,7 +426,7 @@ unsafe fn upload_plane(
     width: i32,
     height: i32,
     format: u32,
-    offset: i32,
+    offset: u32,
 ) {
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
