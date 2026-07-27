@@ -57,6 +57,7 @@ impl Session {
         Err(Error::UnsupportedPlatform)
     }
 
+    #[must_use]
     pub fn media_ingress_stats(&self) -> MediaIngressStats {
         MediaIngressStats::default()
     }

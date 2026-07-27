@@ -374,6 +374,7 @@ impl Session {
         })
     }
 
+    #[must_use]
     pub fn media_ingress_stats(&self) -> MediaIngressStats {
         // SAFETY: `Session` uniquely owns this allocation until native teardown completes in
         // `Drop`. Callback threads update only atomic counters and channel senders.
