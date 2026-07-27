@@ -7,7 +7,7 @@ use crate::{Application, Error, NvClient, Result, ServerInfo};
 const AUDIO_CONFIGURATION_STEREO: i32 = 0x0003_02CA;
 const SURROUND_AUDIO_INFO_STEREO: i32 = 0x0003_0002;
 
-/// Stream profile passed to the GameStream launch and native transport layers.
+/// Stream profile passed to the `GameStream` launch and native transport layers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamProfile {
     width: i32,
