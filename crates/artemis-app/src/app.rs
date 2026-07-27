@@ -496,12 +496,12 @@ impl ArtemisApp {
         if let Some(decoded_frame) = decoded_frame {
             if let Err(error) = self.upload_stream_frame(frame, &decoded_frame) {
                 self.status = error;
-            } else if let Some(active) = &self.active_stream {
-                active.media.record_presented();
+            } else if let Some(active) = &mut self.active_stream {
+                active.media.record_presented(&decoded_frame);
             }
         }
         if let Some(active) = &mut self.active_stream {
-            active.media.report_video_stats();
+            active.media.report_stream_stats(&active.session);
             if let Some(error) = active.media.poll_error() {
                 self.status = error;
                 active.session.request_idr();

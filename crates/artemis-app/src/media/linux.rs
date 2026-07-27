@@ -16,12 +16,15 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::VideoFrameExt;
 
-use artemis_moonlight::{AudioEventReceiver, StreamEvent, VideoEventReceiver};
+use artemis_moonlight::{
+    AudioEventReceiver, NetworkStats, Session, StreamEvent, VideoEventReceiver,
+};
 
 pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
     pub nv12: Vec<u8>,
+    pub presentation_time_us: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,13 +54,73 @@ impl VideoCounters {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AudioStats {
+    packets: u64,
+    media_us: u64,
+    frame_duration_us: u64,
+    first_output_elapsed_us: u64,
+    last_output_elapsed_us: u64,
+}
+
+#[derive(Default)]
+struct AudioCounters {
+    packets: AtomicU64,
+    media_us: AtomicU64,
+    frame_duration_us: AtomicU64,
+    first_output_elapsed_us: AtomicU64,
+    last_output_elapsed_us: AtomicU64,
+}
+
+impl AudioCounters {
+    fn reset(&self, frame_duration_us: u64) {
+        self.packets.store(0, Ordering::Relaxed);
+        self.media_us.store(0, Ordering::Relaxed);
+        self.frame_duration_us
+            .store(frame_duration_us, Ordering::Relaxed);
+        self.first_output_elapsed_us.store(0, Ordering::Relaxed);
+        self.last_output_elapsed_us.store(0, Ordering::Relaxed);
+    }
+
+    fn record_output(&self, origin: Instant, duration_us: u64) {
+        let elapsed_us = duration_micros(origin.elapsed()).saturating_add(1);
+        let _ = self.first_output_elapsed_us.compare_exchange(
+            0,
+            elapsed_us,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.last_output_elapsed_us
+            .store(elapsed_us, Ordering::Relaxed);
+        self.media_us.fetch_add(duration_us, Ordering::Relaxed);
+        self.packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> AudioStats {
+        AudioStats {
+            packets: self.packets.load(Ordering::Relaxed),
+            media_us: self.media_us.load(Ordering::Relaxed),
+            frame_duration_us: self.frame_duration_us.load(Ordering::Relaxed),
+            first_output_elapsed_us: self.first_output_elapsed_us.load(Ordering::Relaxed),
+            last_output_elapsed_us: self.last_output_elapsed_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
 pub struct MediaRuntime {
     video: VideoWorker,
     audio: AudioWorker,
     frames: Receiver<DecodedFrame>,
     video_counters: Arc<VideoCounters>,
+    audio_counters: Arc<AudioCounters>,
+    first_presented_at: Option<Instant>,
+    last_presented_at: Option<Instant>,
+    first_presented_pts_us: Option<u64>,
+    last_presented_pts_us: Option<u64>,
     last_video_report_at: Instant,
     last_video_report: VideoStats,
+    last_ingress_report: artemis_moonlight::MediaIngressStats,
+    last_network_report: NetworkStats,
 }
 
 impl MediaRuntime {
@@ -66,17 +129,26 @@ impl MediaRuntime {
         video_events: VideoEventReceiver,
     ) -> Result<Self, String> {
         gst::init().map_err(|error| error.to_string())?;
+        let clock_origin = Instant::now();
         let (frame_sender, frames) = bounded(2);
         let video_counters = Arc::new(VideoCounters::default());
-        let audio = AudioWorker::spawn(audio_events)?;
+        let audio_counters = Arc::new(AudioCounters::default());
+        let audio = AudioWorker::spawn(audio_events, Arc::clone(&audio_counters), clock_origin)?;
         let video = VideoWorker::spawn(video_events, frame_sender, Arc::clone(&video_counters))?;
         Ok(Self {
             video,
             audio,
             frames,
             video_counters,
+            audio_counters,
+            first_presented_at: None,
+            last_presented_at: None,
+            first_presented_pts_us: None,
+            last_presented_pts_us: None,
             last_video_report_at: Instant::now(),
             last_video_report: VideoStats::default(),
+            last_ingress_report: artemis_moonlight::MediaIngressStats::default(),
+            last_network_report: NetworkStats::default(),
         })
     }
 
@@ -90,13 +162,19 @@ impl MediaRuntime {
         latest
     }
 
-    pub fn record_presented(&self) {
+    pub fn record_presented(&mut self, frame: &DecodedFrame) {
         self.video_counters
             .presented
             .fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        self.first_presented_at.get_or_insert(now);
+        self.first_presented_pts_us
+            .get_or_insert(frame.presentation_time_us);
+        self.last_presented_at = Some(now);
+        self.last_presented_pts_us = Some(frame.presentation_time_us);
     }
 
-    pub fn report_video_stats(&mut self) {
+    pub fn report_stream_stats(&mut self, session: &Session) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_video_report_at);
         if elapsed < Duration::from_secs(1) {
@@ -112,16 +190,68 @@ impl MediaRuntime {
         let dropped = current
             .dropped
             .saturating_sub(self.last_video_report.dropped);
+        let ingress = session.media_ingress_stats();
+        let network = session.network_stats().unwrap_or_default();
+        let video_ingress_fps = rate_per_second(
+            ingress.video_frames,
+            self.last_ingress_report.video_frames,
+            seconds,
+        );
+        let audio_ingress_pps = rate_per_second(
+            ingress.audio_packets,
+            self.last_ingress_report.audio_packets,
+            seconds,
+        );
+        let callback_queue_dropped = ingress
+            .video_queue_dropped
+            .saturating_sub(self.last_ingress_report.video_queue_dropped);
+        let video_network_pps = rate_per_second(
+            u64::from(network.video_packets),
+            u64::from(self.last_network_report.video_packets),
+            seconds,
+        );
+        let audio_network_pps = rate_per_second(
+            u64::from(network.audio_packets),
+            u64::from(self.last_network_report.audio_packets),
+            seconds,
+        );
+        let video_clock = self.video_clock();
+        let audio_clock = audio_clock(self.audio_counters.snapshot());
         tracing::info!(
-            target: "artemis::video",
+            target: "artemis::media",
+            video_ingress_fps,
             submitted_fps,
             decoded_fps,
             presented_fps,
-            dropped,
-            "video pipeline throughput"
+            decoder_queue_dropped = dropped,
+            callback_queue_dropped,
+            audio_ingress_pps,
+            video_network_pps,
+            audio_network_pps,
+            video_media_elapsed_ms = ?video_clock.map(|clock| clock.media_elapsed_ms),
+            video_wall_elapsed_ms = ?video_clock.map(|clock| clock.wall_elapsed_ms),
+            video_clock_drift_ms = ?video_clock.map(|clock| clock.drift_ms),
+            audio_media_elapsed_ms = ?audio_clock.map(|clock| clock.media_elapsed_ms),
+            audio_wall_elapsed_ms = ?audio_clock.map(|clock| clock.wall_elapsed_ms),
+            audio_clock_drift_ms = ?audio_clock.map(|clock| clock.drift_ms),
+            audio_output_latency_ms = PIPEWIRE_AUDIO_LATENCY_MS,
+            "media pipeline telemetry"
         );
         self.last_video_report = current;
+        self.last_ingress_report = ingress;
+        self.last_network_report = network;
         self.last_video_report_at = now;
+    }
+
+    fn video_clock(&self) -> Option<PlaybackClock> {
+        let first_at = self.first_presented_at?;
+        let last_at = self.last_presented_at?;
+        let first_pts = self.first_presented_pts_us?;
+        let last_pts = self.last_presented_pts_us?;
+        Some(PlaybackClock::new(
+            last_pts.saturating_sub(first_pts),
+            last_at.duration_since(first_at),
+        ))
     }
 
     pub fn poll_error(&self) -> Option<String> {
@@ -342,6 +472,7 @@ impl VideoPipeline {
                         width,
                         height,
                         nv12,
+                        presentation_time_us: buffer.pts().map_or(0, gst::ClockTime::useconds),
                     };
                     let _ = frames.try_send(frame);
                     Ok(gst::FlowSuccess::Ok)
@@ -378,6 +509,61 @@ impl VideoPipeline {
             .push_buffer(buffer)
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlaybackClock {
+    media_elapsed_ms: u64,
+    wall_elapsed_ms: u64,
+    drift_ms: i64,
+}
+
+impl PlaybackClock {
+    fn new(media_elapsed_us: u64, wall_elapsed: Duration) -> Self {
+        let wall_elapsed_us = duration_micros(wall_elapsed);
+        Self {
+            media_elapsed_ms: media_elapsed_us / 1_000,
+            wall_elapsed_ms: wall_elapsed_us / 1_000,
+            drift_ms: signed_difference_millis(media_elapsed_us, wall_elapsed_us),
+        }
+    }
+}
+
+fn audio_clock(stats: AudioStats) -> Option<PlaybackClock> {
+    if stats.packets < 2
+        || stats.frame_duration_us == 0
+        || stats.first_output_elapsed_us == 0
+        || stats.last_output_elapsed_us < stats.first_output_elapsed_us
+    {
+        return None;
+    }
+    let media_elapsed_us = stats.media_us.saturating_sub(stats.frame_duration_us);
+    let wall_elapsed_us = stats
+        .last_output_elapsed_us
+        .saturating_sub(stats.first_output_elapsed_us);
+    Some(PlaybackClock {
+        media_elapsed_ms: media_elapsed_us / 1_000,
+        wall_elapsed_ms: wall_elapsed_us / 1_000,
+        drift_ms: signed_difference_millis(media_elapsed_us, wall_elapsed_us),
+    })
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn signed_difference_millis(left_us: u64, right_us: u64) -> i64 {
+    let (positive, magnitude_us) = if left_us >= right_us {
+        (true, left_us - right_us)
+    } else {
+        (false, right_us - left_us)
+    };
+    let magnitude_ms = i64::try_from(magnitude_us / 1_000).unwrap_or(i64::MAX);
+    if positive {
+        magnitude_ms
+    } else {
+        -magnitude_ms
     }
 }
 
@@ -453,12 +639,24 @@ struct AudioWorker {
 }
 
 impl AudioWorker {
-    fn spawn(events: AudioEventReceiver) -> Result<Self, String> {
+    fn spawn(
+        events: AudioEventReceiver,
+        audio_counters: Arc<AudioCounters>,
+        clock_origin: Instant,
+    ) -> Result<Self, String> {
         let (stop, stop_receiver) = bounded(1);
         let (error_sender, errors) = unbounded();
         let thread = thread::Builder::new()
             .name("artemis-audio".to_owned())
-            .spawn(move || run_audio_worker(&events, &stop_receiver, &error_sender))
+            .spawn(move || {
+                run_audio_worker(
+                    &events,
+                    &stop_receiver,
+                    &error_sender,
+                    &audio_counters,
+                    clock_origin,
+                );
+            })
             .map_err(|error| error.to_string())?;
         Ok(Self {
             stop,
@@ -486,7 +684,13 @@ impl Drop for AudioWorker {
     }
 }
 
-fn run_audio_worker(events: &AudioEventReceiver, stop: &Receiver<()>, errors: &Sender<String>) {
+fn run_audio_worker(
+    events: &AudioEventReceiver,
+    stop: &Receiver<()>,
+    errors: &Sender<String>,
+    audio_counters: &Arc<AudioCounters>,
+    clock_origin: Instant,
+) {
     let mut audio = None;
     loop {
         if stop.try_recv().is_ok() {
@@ -508,6 +712,8 @@ fn run_audio_worker(events: &AudioEventReceiver, stop: &Receiver<()>, errors: &S
                     coupled_streams,
                     samples_per_frame,
                     &mapping,
+                    Arc::clone(audio_counters),
+                    clock_origin,
                 ) {
                     Ok(pipeline) => audio = Some(pipeline),
                     Err(error) => {
@@ -545,6 +751,8 @@ struct AudioPipeline {
     timeline: AudioTimeline,
     player: Option<PipeWirePlayer>,
     encoded_diagnostic: Option<BufWriter<File>>,
+    audio_counters: Arc<AudioCounters>,
+    clock_origin: Instant,
 }
 
 struct AudioTimeline {
@@ -553,6 +761,7 @@ struct AudioTimeline {
 }
 
 const AUDIO_MAX_BUFFER_NS: u64 = 100_000_000;
+const PIPEWIRE_AUDIO_LATENCY_MS: u64 = 100;
 
 impl AudioTimeline {
     fn new(sample_rate: i32, samples_per_frame: i32) -> Result<Self, String> {
@@ -594,15 +803,10 @@ impl PipeWirePlayer {
             .arg(sample_rate.to_string())
             .arg("--channels")
             .arg(channels.to_string())
-            .args([
-                "--format",
-                "f32",
-                "--channel-map",
-                "stereo",
-                "--latency",
-                "100ms",
-                "-",
-            ])
+            .args(["--format", "f32", "--channel-map", "stereo"])
+            .arg("--latency")
+            .arg(format!("{PIPEWIRE_AUDIO_LATENCY_MS}ms"))
+            .arg("-")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -652,6 +856,8 @@ impl AudioPipeline {
         coupled_streams: i32,
         samples_per_frame: i32,
         mapping: &[u8],
+        audio_counters: Arc<AudioCounters>,
+        clock_origin: Instant,
     ) -> Result<Self, String> {
         if channels != 2 || streams != 1 || coupled_streams != 1 || mapping != [0, 1] {
             return Err(format!(
@@ -660,6 +866,7 @@ impl AudioPipeline {
             ));
         }
         let timeline = AudioTimeline::new(sample_rate, samples_per_frame)?;
+        audio_counters.reset(timeline.frame_duration.nseconds() / 1_000);
         let player = PipeWirePlayer::spawn(sample_rate, channels).ok();
         let output = if let Some(player) = &player {
             AudioOutput::PipeWirePlayer(player.input_fd()?)
@@ -696,6 +903,8 @@ impl AudioPipeline {
             timeline,
             player,
             encoded_diagnostic,
+            audio_counters,
+            clock_origin,
         })
     }
 
@@ -715,6 +924,8 @@ impl AudioPipeline {
         let (pts, duration) = self.timeline.next(start);
         if packet.is_empty() {
             if self.source.send_event(gst::event::Gap::new(pts, duration)) {
+                self.audio_counters
+                    .record_output(self.clock_origin, duration.nseconds() / 1_000);
                 return Ok(());
             }
             return Err("GStreamer rejected an Opus packet-loss gap".to_owned());
@@ -726,7 +937,10 @@ impl AudioPipeline {
         }
         self.source
             .push_buffer(buffer)
-            .map(|_| ())
+            .map(|_| {
+                self.audio_counters
+                    .record_output(self.clock_origin, duration.nseconds() / 1_000);
+            })
             .map_err(|error| error.to_string())
     }
 }
@@ -852,9 +1066,12 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        AudioOutput, AudioTimeline, audio_pipeline_description, copy_visible_nv12_planes,
-        video_decoder_chain, video_pipeline_description,
+        AudioOutput, AudioStats, AudioTimeline, PlaybackClock, audio_clock,
+        audio_pipeline_description, copy_visible_nv12_planes, video_decoder_chain,
+        video_pipeline_description,
     };
     use gstreamer as gst;
 
@@ -880,6 +1097,31 @@ mod tests {
     fn opus_timeline_rejects_invalid_configuration() {
         assert!(AudioTimeline::new(0, 240).is_err());
         assert!(AudioTimeline::new(48_000, 0).is_err());
+    }
+
+    #[test]
+    fn playback_clock_reports_media_drift_against_wall_time() {
+        let clock = PlaybackClock::new(10_050_000, Duration::from_secs(10));
+
+        assert_eq!(clock.media_elapsed_ms, 10_050);
+        assert_eq!(clock.wall_elapsed_ms, 10_000);
+        assert_eq!(clock.drift_ms, 50);
+    }
+
+    #[test]
+    fn audio_clock_excludes_the_first_packet_duration_from_elapsed_time() {
+        let clock = audio_clock(AudioStats {
+            packets: 201,
+            media_us: 1_005_000,
+            frame_duration_us: 5_000,
+            first_output_elapsed_us: 1,
+            last_output_elapsed_us: 1_000_001,
+        })
+        .expect("enough audio samples");
+
+        assert_eq!(clock.media_elapsed_ms, 1_000);
+        assert_eq!(clock.wall_elapsed_ms, 1_000);
+        assert_eq!(clock.drift_ms, 0);
     }
 
     #[test]

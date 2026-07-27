@@ -7,12 +7,13 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crossbeam_channel::{Sender, bounded, unbounded};
+use crossbeam_channel::{Sender, TrySendError, bounded, unbounded};
 
 use crate::{
-    ConnectionQuality, Error, EventReceiver, NetworkStats, Result, StreamConfig, StreamEvent,
+    ConnectionQuality, Error, EventReceiver, MediaIngressStats, NetworkStats, Result, StreamConfig,
+    StreamEvent,
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -119,6 +120,31 @@ struct CallbackContext {
     control: Sender<StreamEvent>,
     audio: Sender<StreamEvent>,
     video: Sender<StreamEvent>,
+    audio_packets: AtomicU64,
+    video_frames: AtomicU64,
+    video_queue_dropped: AtomicU64,
+}
+
+impl CallbackContext {
+    fn media_ingress_stats(&self) -> MediaIngressStats {
+        MediaIngressStats {
+            audio_packets: self.audio_packets.load(Ordering::Relaxed),
+            video_frames: self.video_frames.load(Ordering::Relaxed),
+            video_queue_dropped: self.video_queue_dropped.load(Ordering::Relaxed),
+        }
+    }
+
+    fn send_video(&self, event: StreamEvent) {
+        self.video_frames.fetch_add(1, Ordering::Relaxed);
+        if matches!(self.video.try_send(event), Err(TrySendError::Full(_))) {
+            self.video_queue_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn send_audio(&self, event: StreamEvent) {
+        self.audio_packets.fetch_add(1, Ordering::Relaxed);
+        let _ = self.audio.send(event);
+    }
 }
 
 /// Sole owner of a process-global moonlight-common-c connection.
@@ -198,6 +224,9 @@ impl Session {
             control: control_sender,
             audio: audio_sender,
             video: video_sender,
+            audio_packets: AtomicU64::new(0),
+            video_frames: AtomicU64::new(0),
+            video_queue_dropped: AtomicU64::new(0),
         });
         let callback_context =
             NonNull::new(Box::into_raw(callback_context)).ok_or(Error::Allocation)?;
@@ -344,6 +373,12 @@ impl Session {
             video_invalid: stats.video_invalid,
         })
     }
+
+    pub fn media_ingress_stats(&self) -> MediaIngressStats {
+        // SAFETY: `Session` uniquely owns this allocation until native teardown completes in
+        // `Drop`. Callback threads update only atomic counters and channel senders.
+        unsafe { self.callback_context.as_ref() }.media_ingress_stats()
+    }
 }
 
 impl Drop for Session {
@@ -469,7 +504,7 @@ extern "C" fn on_video_frame(
         // SAFETY: The C shim guarantees this buffer is valid for exactly this callback. It is
         // copied into owned Rust memory before returning.
         let bytes = unsafe { slice::from_raw_parts(data, length) }.to_vec();
-        let _ = context.video.try_send(StreamEvent::VideoFrame {
+        context.send_video(StreamEvent::VideoFrame {
             bytes,
             key_frame: frame_type == 1,
             presentation_time_us,
@@ -528,6 +563,52 @@ extern "C" fn on_audio_packet(userdata: *mut c_void, data: *const u8, length: us
             // copied into owned Rust memory before returning.
             unsafe { slice::from_raw_parts(data, length) }.to_vec()
         };
-        let _ = context.audio.send(StreamEvent::AudioPacket(packet));
+        context.send_audio(StreamEvent::AudioPacket(packet));
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU64;
+
+    use crossbeam_channel::{bounded, unbounded};
+
+    use super::CallbackContext;
+    use crate::StreamEvent;
+
+    #[test]
+    fn media_ingress_counts_video_queue_drops() {
+        let (control, _control_receiver) = unbounded();
+        let (audio, _audio_receiver) = unbounded();
+        let (video, _video_receiver) = bounded(1);
+        let context = CallbackContext {
+            control,
+            audio,
+            video,
+            audio_packets: AtomicU64::new(0),
+            video_frames: AtomicU64::new(0),
+            video_queue_dropped: AtomicU64::new(0),
+        };
+
+        context.send_video(StreamEvent::VideoFrame {
+            bytes: vec![1],
+            key_frame: true,
+            presentation_time_us: 1,
+        });
+        context.send_video(StreamEvent::VideoFrame {
+            bytes: vec![2],
+            key_frame: false,
+            presentation_time_us: 2,
+        });
+        context.send_audio(StreamEvent::AudioPacket(vec![3]));
+
+        assert_eq!(
+            context.media_ingress_stats(),
+            crate::MediaIngressStats {
+                audio_packets: 1,
+                video_frames: 2,
+                video_queue_dropped: 1,
+            }
+        );
+    }
 }

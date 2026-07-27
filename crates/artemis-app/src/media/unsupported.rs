@@ -1,9 +1,10 @@
-use artemis_moonlight::{AudioEventReceiver, VideoEventReceiver};
+use artemis_moonlight::{AudioEventReceiver, Session, VideoEventReceiver};
 
 pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
     pub nv12: Vec<u8>,
+    pub presentation_time_us: u64,
 }
 
 pub struct MediaRuntime;
@@ -21,9 +22,9 @@ impl MediaRuntime {
         None
     }
 
-    pub fn record_presented(&self) {}
+    pub fn record_presented(&mut self, _frame: &DecodedFrame) {}
 
-    pub fn report_video_stats(&mut self) {}
+    pub fn report_stream_stats(&mut self, _session: &Session) {}
 
     pub fn poll_error(&self) -> Option<String> {
         None

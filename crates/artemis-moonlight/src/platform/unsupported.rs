@@ -1,4 +1,4 @@
-use crate::{Error, EventReceiver, Result, StreamConfig};
+use crate::{Error, EventReceiver, MediaIngressStats, NetworkStats, Result, StreamConfig};
 
 /// Non-Linux compile-time placeholder.
 pub struct Session;
@@ -52,4 +52,12 @@ impl Session {
     }
 
     pub fn request_idr(&mut self) {}
+
+    pub fn network_stats(&self) -> Result<NetworkStats> {
+        Err(Error::UnsupportedPlatform)
+    }
+
+    pub fn media_ingress_stats(&self) -> MediaIngressStats {
+        MediaIngressStats::default()
+    }
 }

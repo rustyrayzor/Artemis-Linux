@@ -43,6 +43,13 @@ pub struct NetworkStats {
     pub video_invalid: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MediaIngressStats {
+    pub audio_packets: u64,
+    pub video_frames: u64,
+    pub video_queue_dropped: u64,
+}
+
 /// Native connection parameters copied into the C shim before connecting.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct StreamConfig {
