@@ -471,7 +471,7 @@ impl ArtemisApp {
                     );
                 }
                 StreamEvent::ConnectionStatus(ConnectionQuality::Poor) => {
-                    self.status = "The stream connection is unstable.".to_owned();
+                    "The stream connection is unstable.".clone_into(&mut self.status);
                 }
                 StreamEvent::Terminated(error) => terminated = Some(error),
                 event @ (StreamEvent::VideoSetup { .. }
