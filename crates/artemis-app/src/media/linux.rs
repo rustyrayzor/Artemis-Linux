@@ -213,7 +213,7 @@ fn run_video_worker(
                         height,
                         fps,
                         frames.clone(),
-                        Arc::clone(&video_counters),
+                        Arc::clone(video_counters),
                     )
                 };
                 match result {
