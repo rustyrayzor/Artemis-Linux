@@ -106,15 +106,7 @@ impl VideoPipeline {
     ) -> Result<Self, String> {
         let has_va_decoder = gst::ElementFactory::find("vah264dec").is_some()
             && gst::ElementFactory::find("vapostproc").is_some();
-        let decoder_chain = video_decoder_chain(has_va_decoder);
-        let (presentation_width, presentation_height) = presentation_size(width, height);
-        let description = format!(
-            "appsrc name=video_src is-live=true format=time do-timestamp=false \
-             caps=video/x-h264,stream-format=byte-stream,alignment=au ! \
-             h264parse config-interval=-1 ! {decoder_chain} ! \
-             video/x-raw,format=RGBA,width={presentation_width},height={presentation_height} ! \
-             appsink name=video_sink max-buffers=2 drop=true sync=false"
-        );
+        let description = video_pipeline_description(width, height, has_va_decoder);
         let pipeline = gst::parse::launch(&description)
             .map_err(|error| error.to_string())?
             .downcast::<gst::Pipeline>()
@@ -133,6 +125,9 @@ impl VideoPipeline {
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    if frames.is_full() {
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
                     let caps = sample.caps().ok_or(gst::FlowError::NotNegotiated)?;
                     let structure = caps.structure(0).ok_or(gst::FlowError::NotNegotiated)?;
                     let width = structure
@@ -188,21 +183,21 @@ impl Drop for VideoPipeline {
 
 fn video_decoder_chain(hardware_available: bool) -> &'static str {
     if hardware_available {
-        "vah264dec ! videorate drop-only=true max-rate=30 ! vapostproc"
+        "vah264dec ! vapostproc"
     } else {
-        "avdec_h264 ! videorate drop-only=true max-rate=30 ! videoconvert ! videoscale"
+        "avdec_h264 ! videoconvert"
     }
 }
 
-fn presentation_size(width: i32, height: i32) -> (i32, i32) {
-    const MAX_PRESENTATION_WIDTH: i32 = 1280;
-
-    if width <= MAX_PRESENTATION_WIDTH || width <= 0 || height <= 0 {
-        return (width, height);
-    }
-    let scaled_height = i64::from(height) * i64::from(MAX_PRESENTATION_WIDTH) / i64::from(width);
-    let scaled_height = i32::try_from(scaled_height).unwrap_or(height).max(2) & !1;
-    (MAX_PRESENTATION_WIDTH, scaled_height)
+fn video_pipeline_description(width: i32, height: i32, hardware_available: bool) -> String {
+    let decoder_chain = video_decoder_chain(hardware_available);
+    format!(
+        "appsrc name=video_src is-live=true format=time do-timestamp=false \
+         caps=video/x-h264,stream-format=byte-stream,alignment=au ! \
+         h264parse config-interval=-1 ! {decoder_chain} ! \
+         video/x-raw,format=RGBA,width={width},height={height} ! \
+         appsink name=video_sink max-buffers=2 drop=true sync=false"
+    )
 }
 
 struct AudioWorker {
@@ -612,8 +607,8 @@ fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioOutput, AudioTimeline, audio_pipeline_description, presentation_size,
-        video_decoder_chain,
+        AudioOutput, AudioTimeline, audio_pipeline_description, video_decoder_chain,
+        video_pipeline_description,
     };
     use gstreamer as gst;
 
@@ -681,20 +676,16 @@ mod tests {
 
     #[test]
     fn video_decoder_prefers_va_api_when_available() {
-        assert_eq!(
-            video_decoder_chain(true),
-            "vah264dec ! videorate drop-only=true max-rate=30 ! vapostproc"
-        );
-        assert_eq!(
-            video_decoder_chain(false),
-            "avdec_h264 ! videorate drop-only=true max-rate=30 ! videoconvert ! videoscale"
-        );
+        assert_eq!(video_decoder_chain(true), "vah264dec ! vapostproc");
+        assert_eq!(video_decoder_chain(false), "avdec_h264 ! videoconvert");
     }
 
     #[test]
-    fn presentation_is_scaled_to_the_reference_window_before_readback() {
-        assert_eq!(presentation_size(1920, 1080), (1280, 720));
-        assert_eq!(presentation_size(1280, 720), (1280, 720));
-        assert_eq!(presentation_size(800, 600), (800, 600));
+    fn video_pipeline_preserves_native_stream_resolution_without_a_frame_rate_cap() {
+        let description = video_pipeline_description(3840, 2160, true);
+
+        assert!(description.contains("video/x-raw,format=RGBA,width=3840,height=2160"));
+        assert!(!description.contains("videorate"));
+        assert!(!description.contains("max-rate=30"));
     }
 }

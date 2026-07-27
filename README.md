@@ -62,8 +62,10 @@ certificate contents, or host pins.
 ## Current scope
 
 The first release supports H.264 at 1920x1080, 2560x1440, or 3840x2160, all at
-60 FPS with SDR, stereo audio, and one controller. The local presentation
-window scales high-resolution streams to fit. HEVC/AV1, HDR, surround audio,
+60 FPS with SDR, native-resolution presentation, stereo audio, and one
+controller. Bitrate is adjustable from 10 to 300 Mbps, with Moonlight-derived
+20, 40, and 80 Mbps defaults. The local window scales the native stream texture
+to fit without lowering its source resolution. HEVC/AV1, HDR, surround audio,
 multi-controller support, touch/pen, remote Internet traversal, and
 Apollo-specific virtual-display controls are outside this first slice.
 

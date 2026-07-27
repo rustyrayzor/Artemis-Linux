@@ -17,6 +17,12 @@ pub struct StreamProfile {
     packet_size: i32,
 }
 
+/// Validated video bitrate for one stream profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamBitrate {
+    kbps: i32,
+}
+
 /// Supported H.264 SDR stream presets.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum StreamPreset {
@@ -39,12 +45,53 @@ impl StreamPreset {
     }
 
     #[must_use]
-    pub const fn profile(self) -> StreamProfile {
+    pub const fn default_bitrate(self) -> StreamBitrate {
         match self {
-            Self::FullHd60 => StreamProfile::new(1920, 1080, 60, 20_000),
-            Self::QuadHd60 => StreamProfile::new(2560, 1440, 60, 40_000),
-            Self::UltraHd60 => StreamProfile::new(3840, 2160, 60, 80_000),
+            Self::FullHd60 => StreamBitrate::new_unchecked(20_000),
+            Self::QuadHd60 => StreamBitrate::new_unchecked(40_000),
+            Self::UltraHd60 => StreamBitrate::new_unchecked(80_000),
         }
+    }
+
+    #[must_use]
+    pub const fn profile(self) -> StreamProfile {
+        self.profile_with_bitrate(self.default_bitrate())
+    }
+
+    #[must_use]
+    pub const fn profile_with_bitrate(self, bitrate: StreamBitrate) -> StreamProfile {
+        match self {
+            Self::FullHd60 => StreamProfile::new(1920, 1080, 60, bitrate.kbps()),
+            Self::QuadHd60 => StreamProfile::new(2560, 1440, 60, bitrate.kbps()),
+            Self::UltraHd60 => StreamProfile::new(3840, 2160, 60, bitrate.kbps()),
+        }
+    }
+}
+
+impl StreamBitrate {
+    pub const MIN_MBPS: i32 = 10;
+    pub const MAX_MBPS: i32 = 300;
+
+    const fn new_unchecked(kbps: i32) -> Self {
+        Self { kbps }
+    }
+
+    #[must_use]
+    pub fn from_mbps(mbps: i32) -> Option<Self> {
+        if !(Self::MIN_MBPS..=Self::MAX_MBPS).contains(&mbps) {
+            return None;
+        }
+        Some(Self::new_unchecked(mbps * 1000))
+    }
+
+    #[must_use]
+    pub const fn mbps(self) -> i32 {
+        self.kbps / 1000
+    }
+
+    #[must_use]
+    pub const fn kbps(self) -> i32 {
+        self.kbps
     }
 }
 
@@ -258,7 +305,7 @@ pub const fn stereo_audio_configuration() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteInputKey, StreamPreset, StreamProfile};
+    use super::{RemoteInputKey, StreamBitrate, StreamPreset, StreamProfile};
 
     #[test]
     fn default_profile_remains_1080p60() {
@@ -290,6 +337,17 @@ mod tests {
                 (width, height, 60, bitrate_kbps, 1392)
             );
         }
+    }
+
+    #[test]
+    fn custom_bitrate_is_validated_up_to_three_hundred_mbps() {
+        let bitrate = StreamBitrate::from_mbps(300).expect("valid maximum bitrate");
+        let profile = StreamPreset::UltraHd60.profile_with_bitrate(bitrate);
+
+        assert_eq!(profile.bitrate_kbps(), 300_000);
+        assert_eq!(bitrate.mbps(), 300);
+        assert!(StreamBitrate::from_mbps(9).is_none());
+        assert!(StreamBitrate::from_mbps(301).is_none());
     }
 
     #[test]

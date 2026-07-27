@@ -46,9 +46,10 @@ RUST_LOG=artemis=debug ./target/release/artemis-linux
 4. Launch Desktop at H.264 1920x1080, 60 FPS, SDR and confirm motion video and
    stereo audio.
 5. Disconnect, select 1440p60, reconnect, and verify Apollo negotiated
-   2560x1440 at 60 FPS. Repeat at 4K60 and verify 3840x2160 at 60 FPS.
-6. Confirm the local presentation remains scaled to fit the Artemis window at
-   each resolution.
+   2560x1440 at 60 FPS and the selected bitrate. Repeat at 4K60 and verify
+   3840x2160 at 60 FPS, including a high-bitrate test up to 300 Mbps.
+6. Confirm the local presentation preserves the selected stream resolution
+   while scaling the image to fit the Artemis window.
 7. Enter fullscreen using the on-screen control, exit with Escape, then toggle
    fullscreen on and off with F11. Confirm the video is edge-to-edge with no
    desktop panel, window decoration, application controls, or status border.

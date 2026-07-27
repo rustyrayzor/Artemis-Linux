@@ -16,7 +16,7 @@ pub use http::NvClient;
 pub use identity::ClientIdentity;
 pub use pairing::{PairingOutcome, generate_pin, pair};
 pub use protocol::{
-    LaunchResult, RemoteInputKey, StreamPreset, StreamProfile, cancel_host_application,
-    launch_application, list_applications, stereo_audio_configuration,
+    LaunchResult, RemoteInputKey, StreamBitrate, StreamPreset, StreamProfile,
+    cancel_host_application, launch_application, list_applications, stereo_audio_configuration,
 };
 pub use store::{HostRecord, HostStore};

@@ -60,6 +60,10 @@ latency or memory growth.
 2. GStreamer supplies a dependable Linux software decode/audio baseline.
 3. The initial H.264 SDR stereo profile set is intentionally limited to
    1080p60, 1440p60, and 4K60. Their bitrates follow Moonlight's defaults:
-   20, 40, and 80 Mbps respectively.
-4. Hardware acceleration is deferred until beta diagnostics can report GPU,
-   driver, decoder, compositor, and negotiated stream details.
+   20, 40, and 80 Mbps respectively, with a validated user override from
+   10 through 300 Mbps.
+4. GStreamer preserves the negotiated dimensions and frame cadence through
+   presentation. A bounded latest-frame queue drops decoded frames when the UI
+   cannot keep up rather than building latency.
+5. Hardware acceleration is selected when the beta diagnostics confirm the
+   required VA-API decoder and post-processing elements are available.

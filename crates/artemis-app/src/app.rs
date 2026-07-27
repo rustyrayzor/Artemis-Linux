@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use artemis_core::{
     Application, ClientIdentity, HostAddress, HostRecord, HostStore, LaunchResult, NvClient,
-    PairingOutcome, ServerInfo, StreamPreset, cancel_host_application, discover, generate_pin,
-    launch_application, list_applications, pair, stereo_audio_configuration,
+    PairingOutcome, ServerInfo, StreamBitrate, StreamPreset, cancel_host_application, discover,
+    generate_pin, launch_application, list_applications, pair, stereo_audio_configuration,
 };
 use artemis_moonlight::{EventReceiver, Session, StreamConfig, StreamEvent};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -35,6 +35,7 @@ pub struct ArtemisApp {
     active_stream: Option<ActiveStream>,
     texture: Option<TextureHandle>,
     stream_preset: StreamPreset,
+    stream_bitrate: StreamBitrate,
     fullscreen: bool,
 }
 
@@ -82,6 +83,7 @@ impl ArtemisApp {
         configure_style(&context.egui_ctx);
         let paired_hosts = store.load().unwrap_or_default();
         let (tasks, task_results) = unbounded();
+        let stream_preset = StreamPreset::default();
         let mut app = Self {
             identity,
             store,
@@ -100,7 +102,8 @@ impl ArtemisApp {
             task_results,
             active_stream: None,
             texture: None,
-            stream_preset: StreamPreset::default(),
+            stream_preset,
+            stream_bitrate: stream_preset.default_bitrate(),
             fullscreen: false,
         };
         app.start_discovery();
@@ -226,7 +229,13 @@ impl ArtemisApp {
         };
         self.busy = true;
         let preset = self.stream_preset;
-        self.status = format!("Launching {} at {}…", application.title, preset.label());
+        let bitrate = self.stream_bitrate;
+        self.status = format!(
+            "Launching {} at {} and {} Mbps…",
+            application.title,
+            preset.label(),
+            bitrate.mbps()
+        );
         let identity = self.identity.clone();
         let sender = self.tasks.clone();
         thread::spawn(move || {
@@ -237,8 +246,12 @@ impl ArtemisApp {
                 Some(record.certificate_der.clone()),
             );
             let title = application.title;
-            let result = launch_application(&mut client, application.id, preset.profile())
-                .map_err(|error| error.to_string());
+            let result = launch_application(
+                &mut client,
+                application.id,
+                preset.profile_with_bitrate(bitrate),
+            )
+            .map_err(|error| error.to_string());
             let _ = sender.send(TaskMessage::Launched {
                 record,
                 title,
@@ -249,10 +262,11 @@ impl ArtemisApp {
 
     fn begin_native_connection(&mut self, record: HostRecord, title: String, launch: LaunchResult) {
         let profile_label = format!(
-            "{}x{} at {} FPS",
+            "{}x{} at {} FPS · {} Mbps",
             launch.profile.width(),
             launch.profile.height(),
-            launch.profile.fps()
+            launch.profile.fps(),
+            launch.profile.bitrate_kbps() / 1000
         );
         self.status = format!("Connecting {title} at {profile_label}…");
         let config = StreamConfig {
@@ -617,9 +631,13 @@ impl ArtemisApp {
                 ui.heading(RichText::new("Artemis Linux").size(30.0));
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new(format!("H.264 · {} · SDR", self.stream_preset.label()))
-                        .small()
-                        .color(Color32::from_rgb(52, 101, 56)),
+                    RichText::new(format!(
+                        "H.264 · {} · {} Mbps · SDR",
+                        self.stream_preset.label(),
+                        self.stream_bitrate.mbps()
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(52, 101, 56)),
                 );
             });
             ui.add_space(28.0);
@@ -673,21 +691,35 @@ impl ArtemisApp {
                 ui.add_space(24.0);
                 section_label(ui, "STREAM QUALITY");
                 ui.add_space(8.0);
+                let previous_preset = self.stream_preset;
                 ui.horizontal(|ui| {
                     for preset in StreamPreset::ALL {
-                        let profile = preset.profile();
-                        let label = format!(
-                            "{} · {} Mbps",
-                            preset.label(),
-                            profile.bitrate_kbps() / 1000
-                        );
-                        ui.selectable_value(&mut self.stream_preset, preset, label);
+                        ui.selectable_value(&mut self.stream_preset, preset, preset.label());
                     }
                 });
+                if self.stream_preset != previous_preset {
+                    self.stream_bitrate = self.stream_preset.default_bitrate();
+                }
+                let mut bitrate_mbps = self.stream_bitrate.mbps();
+                let bitrate_slider = egui::Slider::new(
+                    &mut bitrate_mbps,
+                    StreamBitrate::MIN_MBPS..=StreamBitrate::MAX_MBPS,
+                )
+                .step_by(5.0)
+                .suffix(" Mbps")
+                .text("Bitrate");
+                if ui.add(bitrate_slider).changed()
+                    && let Some(bitrate) = StreamBitrate::from_mbps(bitrate_mbps)
+                {
+                    self.stream_bitrate = bitrate;
+                }
                 ui.label(
-                    RichText::new("H.264 SDR · local window scales to fit")
-                        .small()
-                        .color(Color32::from_rgb(120, 119, 116)),
+                    RichText::new(format!(
+                        "H.264 SDR · {} Mbps default · 300 Mbps maximum",
+                        self.stream_preset.default_bitrate().mbps()
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(120, 119, 116)),
                 );
                 ui.add_space(24.0);
                 section_label(ui, "APPLICATIONS");
