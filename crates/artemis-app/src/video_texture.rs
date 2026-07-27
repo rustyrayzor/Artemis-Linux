@@ -483,23 +483,9 @@ unsafe fn create_resources(gl: &glow::Context) -> Result<Resources, String> {
                 return Err(error);
             }
         };
-        let framebuffer = match gl.create_framebuffer() {
-            Ok(framebuffer) => framebuffer,
+        let [framebuffer, source_framebuffer] = match create_framebuffers(gl) {
+            Ok(framebuffers) => framebuffers,
             Err(error) => {
-                gl.delete_vertex_array(vertex_array);
-                delete_program_resources(
-                    gl,
-                    program,
-                    [first_buffer, second_buffer],
-                    [output, luma, chroma],
-                );
-                return Err(error);
-            }
-        };
-        let source_framebuffer = match gl.create_framebuffer() {
-            Ok(framebuffer) => framebuffer,
-            Err(error) => {
-                gl.delete_framebuffer(framebuffer);
                 gl.delete_vertex_array(vertex_array);
                 delete_program_resources(
                     gl,
@@ -522,6 +508,20 @@ unsafe fn create_resources(gl: &glow::Context) -> Result<Resources, String> {
             framebuffer,
             source_framebuffer,
         })
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe fn create_framebuffers(gl: &glow::Context) -> Result<[glow::Framebuffer; 2], String> {
+    unsafe {
+        let framebuffer = gl.create_framebuffer()?;
+        match gl.create_framebuffer() {
+            Ok(source_framebuffer) => Ok([framebuffer, source_framebuffer]),
+            Err(error) => {
+                gl.delete_framebuffer(framebuffer);
+                Err(error)
+            }
+        }
     }
 }
 

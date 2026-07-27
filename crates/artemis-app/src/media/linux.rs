@@ -24,6 +24,8 @@ use artemis_moonlight::{
     AudioEventReceiver, NetworkStats, Session, StreamEvent, VideoEventReceiver,
 };
 
+type EglGetCurrentDisplay = unsafe extern "C" fn() -> *mut c_void;
+
 pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
@@ -49,7 +51,6 @@ impl GlInteropContext {
         if egl_get_current_display.is_null() {
             return Ok(None);
         }
-        type EglGetCurrentDisplay = unsafe extern "C" fn() -> *mut c_void;
         // SAFETY: eframe's GL loader returned the address for the exact EGL function signature.
         let egl_get_current_display = unsafe {
             std::mem::transmute::<*const c_void, EglGetCurrentDisplay>(egl_get_current_display)
@@ -424,7 +425,7 @@ impl VideoWorker {
                     &error_sender,
                     &frames,
                     &video_counters,
-                    gl_interop,
+                    &gl_interop,
                 );
             })
             .map_err(|error| error.to_string())?;
@@ -460,7 +461,7 @@ fn run_video_worker(
     errors: &Sender<String>,
     frames: &crossbeam_channel::Sender<DecodedFrame>,
     video_counters: &Arc<VideoCounters>,
-    gl_interop: Option<GlInteropContext>,
+    gl_interop: &Option<GlInteropContext>,
 ) {
     let mut video = None;
     loop {
