@@ -58,7 +58,8 @@ latency or memory growth.
 1. The control plane is implemented in Rust; `moonlight-common-c` is retained
    initially for mature transport, FEC, RTSP, and input protocol behavior.
 2. GStreamer supplies a dependable Linux software decode/audio baseline.
-3. The first profile is intentionally fixed at H.264 1080p60 SDR stereo to
-   reduce variables during interoperability testing.
+3. The initial H.264 SDR stereo profile set is intentionally limited to
+   1080p60, 1440p60, and 4K60. Their bitrates follow Moonlight's defaults:
+   20, 40, and 80 Mbps respectively.
 4. Hardware acceleration is deferred until beta diagnostics can report GPU,
    driver, decoder, compositor, and negotiated stream details.

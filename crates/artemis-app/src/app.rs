@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use artemis_core::{
     Application, ClientIdentity, HostAddress, HostRecord, HostStore, LaunchResult, NvClient,
-    PairingOutcome, ServerInfo, StreamProfile, cancel_host_application, discover, generate_pin,
+    PairingOutcome, ServerInfo, StreamPreset, cancel_host_application, discover, generate_pin,
     launch_application, list_applications, pair, stereo_audio_configuration,
 };
 use artemis_moonlight::{EventReceiver, Session, StreamConfig, StreamEvent};
@@ -34,6 +34,7 @@ pub struct ArtemisApp {
     task_results: Receiver<TaskMessage>,
     active_stream: Option<ActiveStream>,
     texture: Option<TextureHandle>,
+    stream_preset: StreamPreset,
 }
 
 struct ActiveStream {
@@ -44,6 +45,7 @@ struct ActiveStream {
     input: InputRouter,
     record: HostRecord,
     app_title: String,
+    profile_label: String,
     connected: bool,
 }
 
@@ -64,6 +66,7 @@ enum TaskMessage {
     NativeConnected {
         record: HostRecord,
         title: String,
+        profile_label: String,
         result: std::result::Result<(Session, EventReceiver), String>,
     },
     Cancelled(std::result::Result<(), String>),
@@ -96,6 +99,7 @@ impl ArtemisApp {
             task_results,
             active_stream: None,
             texture: None,
+            stream_preset: StreamPreset::default(),
         };
         app.start_discovery();
         app
@@ -219,7 +223,8 @@ impl ArtemisApp {
             return;
         };
         self.busy = true;
-        self.status = format!("Launching {}…", application.title);
+        let preset = self.stream_preset;
+        self.status = format!("Launching {} at {}…", application.title, preset.label());
         let identity = self.identity.clone();
         let sender = self.tasks.clone();
         thread::spawn(move || {
@@ -230,7 +235,7 @@ impl ArtemisApp {
                 Some(record.certificate_der.clone()),
             );
             let title = application.title;
-            let result = launch_application(&mut client, application.id, StreamProfile::default())
+            let result = launch_application(&mut client, application.id, preset.profile())
                 .map_err(|error| error.to_string());
             let _ = sender.send(TaskMessage::Launched {
                 record,
@@ -241,20 +246,26 @@ impl ArtemisApp {
     }
 
     fn begin_native_connection(&mut self, record: HostRecord, title: String, launch: LaunchResult) {
-        self.status = format!("Connecting stream for {title}…");
+        let profile_label = format!(
+            "{}x{} at {} FPS",
+            launch.profile.width(),
+            launch.profile.height(),
+            launch.profile.fps()
+        );
+        self.status = format!("Connecting {title} at {profile_label}…");
         let config = StreamConfig {
             address: record.address.host.clone(),
             app_version: launch.server_info.app_version,
             gfe_version: launch.server_info.gfe_version,
             rtsp_session_url: launch.rtsp_session_url,
             server_codec_mode_support: launch.server_info.codec_mode_support,
-            width: launch.profile.width,
-            height: launch.profile.height,
-            fps: launch.profile.fps,
-            bitrate_kbps: launch.profile.bitrate_kbps,
-            packet_size: launch.profile.packet_size,
+            width: launch.profile.width(),
+            height: launch.profile.height(),
+            fps: launch.profile.fps(),
+            bitrate_kbps: launch.profile.bitrate_kbps(),
+            packet_size: launch.profile.packet_size(),
             audio_configuration: stereo_audio_configuration(),
-            client_refresh_rate_x100: launch.profile.fps * 100,
+            client_refresh_rate_x100: launch.profile.fps() * 100,
             remote_input_key: *launch.remote_input.key(),
             remote_input_iv: *launch.remote_input.iv(),
         };
@@ -264,6 +275,7 @@ impl ArtemisApp {
             let _ = sender.send(TaskMessage::NativeConnected {
                 record,
                 title,
+                profile_label,
                 result,
             });
         });
@@ -355,6 +367,7 @@ impl ArtemisApp {
                 TaskMessage::NativeConnected {
                     record,
                     title,
+                    profile_label,
                     result,
                 } => {
                     self.busy = false;
@@ -363,7 +376,8 @@ impl ArtemisApp {
                             let audio_events = events.take_audio();
                             match MediaRuntime::new(audio_events) {
                                 Ok(media) => {
-                                    self.status = format!("Stream connected: {title}");
+                                    self.status =
+                                        format!("Stream connected: {title} at {profile_label}");
                                     self.active_stream = Some(ActiveStream {
                                         session,
                                         events,
@@ -372,6 +386,7 @@ impl ArtemisApp {
                                         input: InputRouter::new(),
                                         record,
                                         app_title: title,
+                                        profile_label,
                                         connected: false,
                                     });
                                     context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
@@ -428,7 +443,10 @@ impl ArtemisApp {
                 }
                 StreamEvent::Connected => {
                     active.connected = true;
-                    self.status = format!("Streaming {}.", active.app_title);
+                    self.status = format!(
+                        "Streaming {} at {}.",
+                        active.app_title, active.profile_label
+                    );
                 }
                 StreamEvent::Terminated(error) => terminated = Some(error),
                 event @ (StreamEvent::VideoSetup { .. }
@@ -576,7 +594,7 @@ impl ArtemisApp {
                 ui.heading(RichText::new("Artemis Linux").size(30.0));
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new("H.264 · 1080p60 · SDR")
+                    RichText::new(format!("H.264 · {} · SDR", self.stream_preset.label()))
                         .small()
                         .color(Color32::from_rgb(52, 101, 56)),
                 );
@@ -630,6 +648,25 @@ impl ArtemisApp {
 
             if !self.applications.is_empty() {
                 ui.add_space(24.0);
+                section_label(ui, "STREAM QUALITY");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    for preset in StreamPreset::ALL {
+                        let profile = preset.profile();
+                        let label = format!(
+                            "{} · {} Mbps",
+                            preset.label(),
+                            profile.bitrate_kbps() / 1000
+                        );
+                        ui.selectable_value(&mut self.stream_preset, preset, label);
+                    }
+                });
+                ui.label(
+                    RichText::new("H.264 SDR · local window scales to fit")
+                        .small()
+                        .color(Color32::from_rgb(120, 119, 116)),
+                );
+                ui.add_space(24.0);
                 section_label(ui, "APPLICATIONS");
                 ui.add_space(8.0);
                 let applications = self.applications.clone();
@@ -669,10 +706,10 @@ impl ArtemisApp {
     fn stream_ui(&mut self, context: &egui::Context) {
         egui::TopBottomPanel::top("stream_controls").show(context, |ui| {
             ui.horizontal(|ui| {
-                let title = self
-                    .active_stream
-                    .as_ref()
-                    .map_or("Stream", |active| active.app_title.as_str());
+                let title = self.active_stream.as_ref().map_or_else(
+                    || "Stream".to_owned(),
+                    |active| format!("{} · {}", active.app_title, active.profile_label),
+                );
                 ui.label(RichText::new(title).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("End host app").clicked() {

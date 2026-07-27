@@ -43,12 +43,16 @@ RUST_LOG=artemis=debug ./target/release/artemis-linux
 2. Start pairing, enter the displayed PIN in Apollo/Sunshine, and confirm the
    host remains paired after restarting Artemis Linux.
 3. Refresh and verify the host application list.
-4. Launch Desktop at H.264 1920x1080, 60 FPS, SDR.
-5. Confirm motion video and stereo audio.
-6. Confirm keyboard press/release, relative mouse movement/buttons/wheel, and
+4. Launch Desktop at H.264 1920x1080, 60 FPS, SDR and confirm motion video and
+   stereo audio.
+5. Disconnect, select 1440p60, reconnect, and verify Apollo negotiated
+   2560x1440 at 60 FPS. Repeat at 4K60 and verify 3840x2160 at 60 FPS.
+6. Confirm the local presentation remains scaled to fit the Artemis window at
+   each resolution.
+7. Confirm keyboard press/release, relative mouse movement/buttons/wheel, and
    one connected controller.
-7. Disconnect and verify the local stream exits without hanging.
-8. Reconnect with Resume, then use End host app and verify `/cancel`.
+8. Disconnect and verify the local stream exits without hanging.
+9. Reconnect with Resume, then use End host app and verify `/cancel`.
 
 Capture `RUST_LOG=artemis=debug` output for any failure. Never include private
 keys or certificate contents in a diagnostic bundle.

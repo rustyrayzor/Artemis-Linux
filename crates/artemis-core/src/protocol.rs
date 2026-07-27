@@ -7,25 +7,89 @@ use crate::{Application, Error, NvClient, Result, ServerInfo};
 const AUDIO_CONFIGURATION_STEREO: i32 = 0x0003_02CA;
 const SURROUND_AUDIO_INFO_STEREO: i32 = 0x0003_0002;
 
-/// Fixed first-release stream profile.
+/// Stream profile passed to the GameStream launch and native transport layers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamProfile {
-    pub width: i32,
-    pub height: i32,
-    pub fps: i32,
-    pub bitrate_kbps: i32,
-    pub packet_size: i32,
+    width: i32,
+    height: i32,
+    fps: i32,
+    bitrate_kbps: i32,
+    packet_size: i32,
+}
+
+/// Supported H.264 SDR stream presets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StreamPreset {
+    #[default]
+    FullHd60,
+    QuadHd60,
+    UltraHd60,
+}
+
+impl StreamPreset {
+    pub const ALL: [Self; 3] = [Self::FullHd60, Self::QuadHd60, Self::UltraHd60];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FullHd60 => "1080p60",
+            Self::QuadHd60 => "1440p60",
+            Self::UltraHd60 => "4K60",
+        }
+    }
+
+    #[must_use]
+    pub const fn profile(self) -> StreamProfile {
+        match self {
+            Self::FullHd60 => StreamProfile::new(1920, 1080, 60, 20_000),
+            Self::QuadHd60 => StreamProfile::new(2560, 1440, 60, 40_000),
+            Self::UltraHd60 => StreamProfile::new(3840, 2160, 60, 80_000),
+        }
+    }
+}
+
+impl StreamProfile {
+    const PACKET_SIZE: i32 = 1392;
+
+    const fn new(width: i32, height: i32, fps: i32, bitrate_kbps: i32) -> Self {
+        Self {
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+            packet_size: Self::PACKET_SIZE,
+        }
+    }
+
+    #[must_use]
+    pub const fn width(self) -> i32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(self) -> i32 {
+        self.height
+    }
+
+    #[must_use]
+    pub const fn fps(self) -> i32 {
+        self.fps
+    }
+
+    #[must_use]
+    pub const fn bitrate_kbps(self) -> i32 {
+        self.bitrate_kbps
+    }
+
+    #[must_use]
+    pub const fn packet_size(self) -> i32 {
+        self.packet_size
+    }
 }
 
 impl Default for StreamProfile {
     fn default() -> Self {
-        Self {
-            width: 1920,
-            height: 1080,
-            fps: 60,
-            bitrate_kbps: 20_000,
-            packet_size: 1392,
-        }
+        StreamPreset::default().profile()
     }
 }
 
@@ -135,7 +199,7 @@ pub fn launch_application(
         ("appid", app_id.to_string()),
         (
             "mode",
-            format!("{}x{}x{}", profile.width, profile.height, profile.fps),
+            format!("{}x{}x{}", profile.width(), profile.height(), profile.fps()),
         ),
         ("scaleFactor", "100".to_owned()),
         ("additionalStates", "1".to_owned()),
@@ -194,15 +258,38 @@ pub const fn stereo_audio_configuration() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteInputKey, StreamProfile};
+    use super::{RemoteInputKey, StreamPreset, StreamProfile};
 
     #[test]
-    fn profile_matches_reference_slice() {
+    fn default_profile_remains_1080p60() {
         let profile = StreamProfile::default();
         assert_eq!(
-            (profile.width, profile.height, profile.fps),
+            (profile.width(), profile.height(), profile.fps()),
             (1920, 1080, 60)
         );
+    }
+
+    #[test]
+    fn presets_match_moonlight_bitrate_defaults() {
+        let expected = [
+            (StreamPreset::FullHd60, 1920, 1080, 20_000),
+            (StreamPreset::QuadHd60, 2560, 1440, 40_000),
+            (StreamPreset::UltraHd60, 3840, 2160, 80_000),
+        ];
+
+        for (preset, width, height, bitrate_kbps) in expected {
+            let profile = preset.profile();
+            assert_eq!(
+                (
+                    profile.width(),
+                    profile.height(),
+                    profile.fps(),
+                    profile.bitrate_kbps(),
+                    profile.packet_size(),
+                ),
+                (width, height, 60, bitrate_kbps, 1392)
+            );
+        }
     }
 
     #[test]

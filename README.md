@@ -10,8 +10,8 @@ The first supported vertical slice includes:
 - local-network `_nvstream._tcp` discovery and manual host entry;
 - PIN pairing with a persisted client certificate and per-host certificate pin;
 - paired host status and application listing;
-- H.264/1080p60 SDR video through GStreamer, with stereo Opus decoded through
-  GStreamer and played through PipeWire;
+- selectable H.264 1080p60, 1440p60, and 4K60 SDR video through GStreamer, with
+  stereo Opus decoded through GStreamer and played through PipeWire;
 - keyboard, relative mouse, wheel, and one game controller;
 - disconnect, host application cancellation, and RAII cleanup.
 
@@ -59,8 +59,9 @@ certificate contents, or host pins.
 
 ## Current scope
 
-The first release deliberately fixes the stream profile to H.264, 1920x1080,
-60 FPS, SDR, stereo audio, and one controller. HEVC/AV1, HDR, surround audio,
+The first release supports H.264 at 1920x1080, 2560x1440, or 3840x2160, all at
+60 FPS with SDR, stereo audio, and one controller. The local presentation
+window scales high-resolution streams to fit. HEVC/AV1, HDR, surround audio,
 multi-controller support, touch/pen, remote Internet traversal, and
 Apollo-specific virtual-display controls are outside this first slice.
 
