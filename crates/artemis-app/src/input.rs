@@ -10,13 +10,22 @@ use eframe::egui::{self, Event, Key, Modifiers, PointerButton};
 pub struct InputRouter {
     pressed_keys: BTreeSet<i16>,
     pressed_buttons: BTreeSet<i32>,
+    preferences: InputPreferences,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InputPreferences {
+    pub optimize_mouse_for_desktop: bool,
+    pub swap_mouse_buttons: bool,
+    pub reverse_scrolling: bool,
 }
 
 impl InputRouter {
-    pub fn new() -> Self {
+    pub fn new(preferences: InputPreferences) -> Self {
         Self {
             pressed_keys: BTreeSet::new(),
             pressed_buttons: BTreeSet::new(),
+            preferences,
         }
     }
 
@@ -33,13 +42,23 @@ impl InputRouter {
                     let x = rounded_i16(delta.x);
                     let y = rounded_i16(delta.y);
                     if x != 0 || y != 0 {
-                        let _ = session.mouse_move(x, y);
+                        if self.preferences.optimize_mouse_for_desktop {
+                            let size = context.input(|input| input.screen_rect().size());
+                            let _ = session.mouse_move_as_position(
+                                x,
+                                y,
+                                positive_i16(size.x),
+                                positive_i16(size.y),
+                            );
+                        } else {
+                            let _ = session.mouse_move(x, y);
+                        }
                     }
                 }
                 Event::PointerButton {
                     button, pressed, ..
                 } => {
-                    let button = mouse_button(button);
+                    let button = mouse_button(button, self.preferences.swap_mouse_buttons);
                     if pressed {
                         self.pressed_buttons.insert(button);
                     } else {
@@ -53,8 +72,13 @@ impl InputRouter {
                     let _ = session.mouse_button(action, button);
                 }
                 Event::MouseWheel { delta, .. } => {
-                    let vertical = rounded_i16(-delta.y * 120.0);
-                    let horizontal = rounded_i16(-delta.x * 120.0);
+                    let direction = if self.preferences.reverse_scrolling {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    let vertical = rounded_i16(direction * delta.y * 120.0);
+                    let horizontal = rounded_i16(direction * delta.x * 120.0);
                     if vertical != 0 || horizontal != 0 {
                         let _ = session.scroll(vertical, horizontal);
                     }
@@ -114,6 +138,11 @@ fn rounded_i16(value: f32) -> i16 {
         .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn positive_i16(value: f32) -> i16 {
+    value.round().clamp(1.0, f32::from(i16::MAX)) as i16
+}
+
 fn modifier_flags(modifiers: Modifiers) -> u8 {
     (if modifiers.shift { MODIFIER_SHIFT } else { 0 })
         | (if modifiers.ctrl { MODIFIER_CTRL } else { 0 })
@@ -121,8 +150,10 @@ fn modifier_flags(modifiers: Modifiers) -> u8 {
         | (if modifiers.mac_cmd { MODIFIER_META } else { 0 })
 }
 
-fn mouse_button(button: PointerButton) -> i32 {
+fn mouse_button(button: PointerButton, swap_primary: bool) -> i32 {
     match button {
+        PointerButton::Primary if swap_primary => MOUSE_RIGHT,
+        PointerButton::Secondary if swap_primary => MOUSE_LEFT,
         PointerButton::Primary => MOUSE_LEFT,
         PointerButton::Secondary => MOUSE_RIGHT,
         PointerButton::Middle => MOUSE_MIDDLE,
@@ -214,9 +245,10 @@ fn virtual_key(key: Key) -> Option<i16> {
 
 #[cfg(test)]
 mod tests {
-    use eframe::egui::Key;
+    use artemis_moonlight::{MOUSE_LEFT, MOUSE_RIGHT};
+    use eframe::egui::{Key, PointerButton};
 
-    use super::is_local_shortcut;
+    use super::{is_local_shortcut, mouse_button};
 
     #[test]
     fn local_stream_shortcuts_are_not_forwarded_to_the_host() {
@@ -225,5 +257,12 @@ mod tests {
         assert!(is_local_shortcut(Key::Escape, true));
         assert!(!is_local_shortcut(Key::Escape, false));
         assert!(!is_local_shortcut(Key::F12, true));
+    }
+
+    #[test]
+    fn mouse_button_swap_affects_only_primary_and_secondary_buttons() {
+        assert_eq!(mouse_button(PointerButton::Primary, false), MOUSE_LEFT);
+        assert_eq!(mouse_button(PointerButton::Primary, true), MOUSE_RIGHT);
+        assert_eq!(mouse_button(PointerButton::Secondary, true), MOUSE_LEFT);
     }
 }

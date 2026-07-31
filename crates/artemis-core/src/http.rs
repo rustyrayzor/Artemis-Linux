@@ -14,6 +14,7 @@ use crate::{ClientIdentity, Error, HostAddress, Result, ServerInfo};
 const DEFAULT_HTTPS_PORT: u16 = 47_984;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(7);
+const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// `GameStream` HTTP client with mutual TLS and exact server-certificate pinning.
 pub struct NvClient {
@@ -131,6 +132,15 @@ impl NvClient {
         self.request(path, parameters, Transport::Https, wait_for_user)
     }
 
+    pub(crate) fn request_https_bytes(
+        &self,
+        path: &str,
+        parameters: &[(&str, String)],
+        wait_for_user: bool,
+    ) -> Result<Vec<u8>> {
+        self.request_bytes(path, parameters, Transport::Https, wait_for_user)
+    }
+
     fn request(
         &self,
         path: &str,
@@ -138,6 +148,18 @@ impl NvClient {
         transport: Transport,
         wait_for_user: bool,
     ) -> Result<String> {
+        let body = self.request_bytes(path, parameters, transport, wait_for_user)?;
+        String::from_utf8(body)
+            .map_err(|error| Error::Http(format!("HTTP response body was not UTF-8: {error}")))
+    }
+
+    fn request_bytes(
+        &self,
+        path: &str,
+        parameters: &[(&str, String)],
+        transport: Transport,
+        wait_for_user: bool,
+    ) -> Result<Vec<u8>> {
         let mut serializer = form_urlencoded::Serializer::new(String::new());
         for (name, value) in parameters {
             serializer.append_pair(name, value);
@@ -187,7 +209,7 @@ impl NvClient {
             }
         };
 
-        parse_http_response(&response)
+        parse_http_response_bytes(&response)
     }
 }
 
@@ -237,11 +259,26 @@ where
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
     let mut response = Vec::with_capacity(8 * 1024);
-    stream.read_to_end(&mut response)?;
+    stream
+        .take(MAX_HTTP_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response)?;
+    if response.len() as u64 > MAX_HTTP_RESPONSE_BYTES {
+        return Err(Error::Http(format!(
+            "HTTP response exceeded the {} MiB safety limit",
+            MAX_HTTP_RESPONSE_BYTES / (1024 * 1024)
+        )));
+    }
     Ok(response)
 }
 
+#[cfg(test)]
 fn parse_http_response(response: &[u8]) -> Result<String> {
+    let body = parse_http_response_bytes(response)?;
+    String::from_utf8(body)
+        .map_err(|error| Error::Http(format!("HTTP response body was not UTF-8: {error}")))
+}
+
+fn parse_http_response_bytes(response: &[u8]) -> Result<Vec<u8>> {
     let separator = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -270,8 +307,7 @@ fn parse_http_response(response: &[u8]) -> Result<String> {
     }) {
         body = decode_chunked(&body)?;
     }
-    String::from_utf8(body)
-        .map_err(|error| Error::Http(format!("HTTP response body was not UTF-8: {error}")))
+    Ok(body)
 }
 
 fn decode_chunked(body: &[u8]) -> Result<Vec<u8>> {
@@ -384,7 +420,7 @@ impl XmlDocument {
 
 #[cfg(test)]
 mod tests {
-    use super::{XmlDocument, decode_chunked, parse_http_response};
+    use super::{XmlDocument, decode_chunked, parse_http_response, parse_http_response_bytes};
 
     #[test]
     fn parses_xml_status_and_fields() {
@@ -415,5 +451,14 @@ mod tests {
     fn parses_http_body() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
         assert_eq!(parse_http_response(response).expect("response"), "OK");
+    }
+
+    #[test]
+    fn preserves_binary_http_body() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n\x89PNG";
+        assert_eq!(
+            parse_http_response_bytes(response).expect("response"),
+            b"\x89PNG"
+        );
     }
 }

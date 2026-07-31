@@ -1,6 +1,8 @@
 use artemis_moonlight::Session;
 use gilrs::{Axis, Button, EventType, Gilrs};
 
+use super::ControllerPreferences;
+
 const UP: i32 = 0x0001;
 const DOWN: i32 = 0x0002;
 const LEFT: i32 = 0x0004;
@@ -32,18 +34,26 @@ pub struct ControllerManager {
     gilrs: Option<Gilrs>,
     connected: bool,
     state: State,
+    preferences: ControllerPreferences,
 }
 
 impl ControllerManager {
-    pub fn new() -> Self {
+    pub fn new(preferences: ControllerPreferences) -> Self {
         Self {
             gilrs: Gilrs::new().ok(),
             connected: false,
             state: State::default(),
+            preferences,
         }
     }
 
-    pub fn poll(&mut self, session: &mut Session) {
+    pub fn poll(&mut self, session: &mut Session, window_focused: bool) {
+        if !window_focused && !self.preferences.background_input {
+            return;
+        }
+        if self.preferences.force_gamepad_one && !self.connected {
+            self.connected = session.controller_arrival().is_ok();
+        }
         let Some(gilrs) = &mut self.gilrs else {
             return;
         };
@@ -63,13 +73,13 @@ impl ControllerManager {
                     }
                 }
                 EventType::ButtonPressed(button, _) => {
-                    if let Some(flag) = button_flag(button) {
+                    if let Some(flag) = button_flag(button, self.preferences.swap_face_buttons) {
                         self.state.buttons |= flag;
                         changed = true;
                     }
                 }
                 EventType::ButtonReleased(button, _) => {
-                    if let Some(flag) = button_flag(button) {
+                    if let Some(flag) = button_flag(button, self.preferences.swap_face_buttons) {
                         self.state.buttons &= !flag;
                         changed = true;
                     }
@@ -124,8 +134,12 @@ impl ControllerManager {
     }
 }
 
-fn button_flag(button: Button) -> Option<i32> {
+fn button_flag(button: Button, swap_face_buttons: bool) -> Option<i32> {
     Some(match button {
+        Button::South if swap_face_buttons => B,
+        Button::East if swap_face_buttons => A,
+        Button::West if swap_face_buttons => Y,
+        Button::North if swap_face_buttons => X,
         Button::South => A,
         Button::East => B,
         Button::West => X,
@@ -154,4 +168,18 @@ fn stick(value: f32) -> i16 {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn trigger(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * f32::from(u8::MAX)).round() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{A, B, X, Y, button_flag};
+    use gilrs::Button;
+
+    #[test]
+    fn face_button_swap_changes_both_button_pairs() {
+        assert_eq!(button_flag(Button::South, false), Some(A));
+        assert_eq!(button_flag(Button::South, true), Some(B));
+        assert_eq!(button_flag(Button::West, false), Some(X));
+        assert_eq!(button_flag(Button::West, true), Some(Y));
+    }
 }

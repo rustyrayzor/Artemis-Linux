@@ -15,6 +15,7 @@ typedef struct AmlStartConfig {
     const char* gfe_version;
     const char* rtsp_session_url;
     int32_t server_codec_mode_support;
+    int32_t supported_video_formats;
     int32_t width;
     int32_t height;
     int32_t fps;
@@ -22,9 +23,22 @@ typedef struct AmlStartConfig {
     int32_t packet_size;
     int32_t audio_configuration;
     int32_t client_refresh_rate_x100;
+    int32_t hdr_enabled;
     uint8_t remote_input_key[16];
     uint8_t remote_input_iv[16];
 } AmlStartConfig;
+
+typedef struct AmlHdrMetadata {
+    uint16_t display_primaries_x[3];
+    uint16_t display_primaries_y[3];
+    uint16_t white_point_x;
+    uint16_t white_point_y;
+    uint16_t max_display_luminance;
+    uint16_t min_display_luminance;
+    uint16_t max_content_light_level;
+    uint16_t max_frame_average_light_level;
+    uint16_t max_full_frame_luminance;
+} AmlHdrMetadata;
 
 typedef struct AmlNetworkStats {
     uint32_t audio_packets;
@@ -45,6 +59,11 @@ typedef struct AmlCallbacks {
     void (*connected)(void* userdata);
     void (*terminated)(void* userdata, int32_t error);
     void (*connection_status)(void* userdata, int32_t status);
+    void (*hdr_mode)(
+        void* userdata,
+        int32_t active,
+        const AmlHdrMetadata* metadata
+    );
     int32_t (*video_setup)(
         void* userdata,
         int32_t format,
@@ -57,7 +76,10 @@ typedef struct AmlCallbacks {
         const uint8_t* data,
         size_t length,
         int32_t frame_type,
-        uint64_t presentation_time_us
+        uint64_t presentation_time_us,
+        int32_t hdr_active,
+        int32_t color_space,
+        const AmlHdrMetadata* hdr_metadata
     );
     int32_t (*audio_setup)(
         void* userdata,
@@ -86,6 +108,13 @@ int32_t aml_session_network_stats(
 );
 
 int32_t aml_mouse_move(AmlSession* session, int16_t x, int16_t y);
+int32_t aml_mouse_move_as_position(
+    AmlSession* session,
+    int16_t x,
+    int16_t y,
+    int16_t reference_width,
+    int16_t reference_height
+);
 int32_t aml_mouse_button(AmlSession* session, uint8_t action, int32_t button);
 int32_t aml_scroll(AmlSession* session, int16_t vertical, int16_t horizontal);
 int32_t aml_keyboard(

@@ -35,6 +35,7 @@ pub struct ServerInfo {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Application {
     pub id: i32,
+    pub uuid: Option<String>,
     pub title: String,
     pub hdr_supported: bool,
 }

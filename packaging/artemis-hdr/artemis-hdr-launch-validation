@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+export PATH="/home/ray-svc/.local/bin:$PATH"
+export RUST_LOG="artemis=info,artemis_core=info,artemis_moonlight=info"
+export ARTEMIS_COMPOSITOR_VSYNC="1"
+export ARTEMIS_AUTOSTART_HOST="192.168.100.128"
+export ARTEMIS_AUTOSTART_APP="Desktop"
+export ARTEMIS_AUTOSTART_PRESET="4K"
+export ARTEMIS_AUTOSTART_FPS="60"
+export ARTEMIS_AUTOSTART_BITRATE_MBPS="40"
+export ARTEMIS_AUTOSTART_CODEC="av1"
+export ARTEMIS_AUTOSTART_FULLSCREEN="true"
+export ARTEMIS_AUTOSTOP_AFTER_SECONDS="20"
+export ARTEMIS_AUTOSTOP_CANCEL_HOST="false"
+
+exec /home/ray-svc/.local/bin/artemis-linux

@@ -1,0 +1,7 @@
+[User]
+Session=artemis-hdr
+Icon=/home/ray-svc/.face
+SystemAccount=false
+
+[InputSource0]
+xkb=us

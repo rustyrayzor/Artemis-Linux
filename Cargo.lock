@@ -114,7 +114,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "artemis-app"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "anyhow",
  "artemis-core",
@@ -127,13 +127,19 @@ dependencies = [
  "gstreamer-gl",
  "gstreamer-gl-egl",
  "gstreamer-video",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
 name = "artemis-core"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "directories",
  "hex",
@@ -151,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "artemis-moonlight"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "cmake",
  "crossbeam-channel",
@@ -593,8 +599,6 @@ dependencies = [
 [[package]]
 name = "eframe"
 version = "0.31.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0dfe0859f3fb1bc6424c57d41e10e9093fe938f426b691e42272c2f336d915c"
 dependencies = [
  "ahash",
  "bytemuck",

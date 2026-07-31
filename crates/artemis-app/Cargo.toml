@@ -1,6 +1,6 @@
 [package]
 name = "artemis-app"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,8 +16,11 @@ artemis-core = { path = "../artemis-core" }
 artemis-moonlight = { path = "../artemis-moonlight" }
 crossbeam-channel.workspace = true
 eframe.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gilrs.workspace = true
@@ -25,7 +28,10 @@ gstreamer.workspace = true
 gstreamer-app.workspace = true
 gstreamer-gl.workspace = true
 gstreamer-gl-egl.workspace = true
-gstreamer-video.workspace = true
+gstreamer-video = { workspace = true, features = ["v1_18"] }
+raw-window-handle.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
 
 [lints]
 workspace = true

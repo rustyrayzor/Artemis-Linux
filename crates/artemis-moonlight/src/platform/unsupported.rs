@@ -17,6 +17,16 @@ impl Session {
         Err(Error::UnsupportedPlatform)
     }
 
+    pub fn mouse_move_as_position(
+        &mut self,
+        _x: i16,
+        _y: i16,
+        _reference_width: i16,
+        _reference_height: i16,
+    ) -> Result<()> {
+        Err(Error::UnsupportedPlatform)
+    }
+
     pub fn mouse_button(&mut self, _action: u8, _button: i32) -> Result<()> {
         Err(Error::UnsupportedPlatform)
     }

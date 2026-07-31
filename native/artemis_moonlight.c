@@ -83,6 +83,42 @@ static void connection_status_update(int status) {
     }
 }
 
+static bool copy_hdr_metadata(AmlHdrMetadata* destination) {
+    SS_HDR_METADATA source;
+    if (destination == NULL || !LiGetHdrMetadata(&source)) {
+        return false;
+    }
+    for (size_t index = 0; index < 3; index++) {
+        destination->display_primaries_x[index] = source.displayPrimaries[index].x;
+        destination->display_primaries_y[index] = source.displayPrimaries[index].y;
+    }
+    destination->white_point_x = source.whitePoint.x;
+    destination->white_point_y = source.whitePoint.y;
+    destination->max_display_luminance = source.maxDisplayLuminance;
+    destination->min_display_luminance = source.minDisplayLuminance;
+    destination->max_content_light_level = source.maxContentLightLevel;
+    destination->max_frame_average_light_level = source.maxFrameAverageLightLevel;
+    destination->max_full_frame_luminance = source.maxFullFrameLuminance;
+    return true;
+}
+
+static void set_hdr_mode(bool active) {
+    AmlSession* session = active_session();
+    if (session == NULL || session->callbacks.hdr_mode == NULL) {
+        return;
+    }
+    AmlHdrMetadata metadata;
+    const AmlHdrMetadata* metadata_pointer = NULL;
+    if (active && copy_hdr_metadata(&metadata)) {
+        metadata_pointer = &metadata;
+    }
+    session->callbacks.hdr_mode(
+        session->callbacks.userdata,
+        active ? 1 : 0,
+        metadata_pointer
+    );
+}
+
 static int video_setup(
     int format,
     int width,
@@ -139,12 +175,20 @@ static int video_submit(PDECODE_UNIT unit) {
         return DR_NEED_IDR;
     }
 
+    AmlHdrMetadata metadata;
+    const AmlHdrMetadata* metadata_pointer = NULL;
+    if (unit->hdrActive && copy_hdr_metadata(&metadata)) {
+        metadata_pointer = &metadata;
+    }
     session->callbacks.video_frame(
         session->callbacks.userdata,
         session->video_scratch,
         required,
         unit->frameType,
-        unit->presentationTimeUs
+        unit->presentationTimeUs,
+        unit->hdrActive ? 1 : 0,
+        (int32_t)unit->colorspace,
+        metadata_pointer
     );
     return DR_OK;
 }
@@ -223,9 +267,10 @@ AmlSession* aml_session_create(
     session->stream.packetSize = config->packet_size;
     session->stream.streamingRemotely = STREAM_CFG_AUTO;
     session->stream.audioConfiguration = config->audio_configuration;
-    session->stream.supportedVideoFormats = VIDEO_FORMAT_H264;
+    session->stream.supportedVideoFormats = config->supported_video_formats;
     session->stream.clientRefreshRateX100 = config->client_refresh_rate_x100;
-    session->stream.colorSpace = COLORSPACE_REC_709;
+    session->stream.colorSpace = config->hdr_enabled != 0 ?
+        COLORSPACE_REC_2020 : COLORSPACE_REC_709;
     session->stream.colorRange = COLOR_RANGE_LIMITED;
     session->stream.encryptionFlags = ENCFLG_ALL;
     memcpy(
@@ -246,12 +291,15 @@ AmlSession* aml_session_create(
     session->connection_callbacks.connectionStarted = connection_started;
     session->connection_callbacks.connectionTerminated = connection_terminated;
     session->connection_callbacks.connectionStatusUpdate = connection_status_update;
+    session->connection_callbacks.setHdrMode = set_hdr_mode;
 
     LiInitializeVideoCallbacks(&session->video_callbacks);
     session->video_callbacks.setup = video_setup;
     session->video_callbacks.submitDecodeUnit = video_submit;
     session->video_callbacks.capabilities = CAPABILITY_DIRECT_SUBMIT |
-        CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC;
+        CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC |
+        CAPABILITY_REFERENCE_FRAME_INVALIDATION_HEVC |
+        CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1;
 
     LiInitializeAudioCallbacks(&session->audio_callbacks);
     session->audio_callbacks.init = audio_setup;
@@ -372,6 +420,23 @@ static bool can_send_input(AmlSession* session) {
 int32_t aml_mouse_move(AmlSession* session, int16_t x, int16_t y) {
     return can_send_input(session)
         ? LiSendMouseMoveEvent(x, y)
+        : AML_ERR_INACTIVE;
+}
+
+int32_t aml_mouse_move_as_position(
+    AmlSession* session,
+    int16_t x,
+    int16_t y,
+    int16_t reference_width,
+    int16_t reference_height
+) {
+    return can_send_input(session)
+        ? LiSendMouseMoveAsMousePositionEvent(
+            x,
+            y,
+            reference_width,
+            reference_height
+        )
         : AML_ERR_INACTIVE;
 }
 

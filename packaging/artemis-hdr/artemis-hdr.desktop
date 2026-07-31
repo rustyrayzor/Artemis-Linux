@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Artemis HDR
+Comment=Native HDR10 Moonlight client session
+Exec=/usr/local/bin/artemis-hdr-session
+Type=Application
+DesktopNames=ArtemisHDR

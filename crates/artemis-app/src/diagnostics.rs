@@ -18,17 +18,48 @@ pub fn print_report() {
     for plugin in [
         "h264parse",
         "avdec_h264",
+        "h265parse",
+        "avdec_h265",
+        "av1parse",
+        "av1dec",
+        "dav1ddec",
+        "avdec_av1",
         "opusparse",
         "opusdec",
         "pipewiresink",
         "pulsesink",
         "vah264dec",
+        "vah265dec",
+        "vaav1dec",
         "vapostproc",
+        "videoconvert",
         "videorate",
         "videoscale",
     ] {
         report_plugin(plugin);
     }
+    let decoders = crate::media::decoder_capabilities();
+    println!("decoder_h264_available={}", decoders.h264.available);
+    println!("decoder_h264_hardware={}", decoders.h264.hardware);
+    println!("decoder_h264_main10={}", decoders.h264.main10);
+    println!("decoder_hevc_available={}", decoders.hevc.available);
+    println!("decoder_hevc_hardware={}", decoders.hevc.hardware);
+    println!("decoder_hevc_main10={}", decoders.hevc.main10);
+    println!("decoder_av1_available={}", decoders.av1.available);
+    println!("decoder_av1_hardware={}", decoders.av1.hardware);
+    println!("decoder_av1_main10={}", decoders.av1.main10);
+    println!("presentation_framebuffer_bit_depth=requires_window_context");
+    let hdr = crate::media::hdr_display_capabilities();
+    println!(
+        "hdr_display_output={}",
+        hdr.output_name.as_deref().unwrap_or("none")
+    );
+    println!("hdr_display_edid_hdr10={}", hdr.display_hdr10);
+    println!(
+        "hdr_native_presentation_available={}",
+        hdr.native_hdr_presentation
+    );
+    println!("hdr_presentation_reason={}", hdr.presentation_reason);
     println!(
         "dri_render_nodes={}",
         directory_entries(Path::new("/dev/dri")).join(",")

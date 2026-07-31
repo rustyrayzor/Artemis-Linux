@@ -1,4 +1,8 @@
 /target/
+/dist/
+/artifacts/
+/.codex-remote-attachments/
+/.planning/
 /.idea/
 /.vscode/
 *.swp

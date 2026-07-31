@@ -18,10 +18,129 @@ pub const MOUSE_RIGHT: i32 = 0x03;
 pub const MOUSE_X1: i32 = 0x04;
 pub const MOUSE_X2: i32 = 0x05;
 
+pub const VIDEO_FORMAT_H264: i32 = 0x0001;
+pub const VIDEO_FORMAT_HEVC: i32 = 0x0100;
+pub const VIDEO_FORMAT_HEVC_MAIN10: i32 = 0x0200;
+pub const VIDEO_FORMAT_AV1: i32 = 0x1000;
+pub const VIDEO_FORMAT_AV1_MAIN10: i32 = 0x2000;
+
+const VIDEO_FORMAT_MASK_H264: i32 = 0x000f;
+const VIDEO_FORMAT_MASK_HEVC: i32 = 0x0f00;
+const VIDEO_FORMAT_MASK_AV1: i32 = 0xf000;
+const VIDEO_FORMAT_MASK_10_BIT: i32 = 0xaa00;
+
 pub const MODIFIER_SHIFT: u8 = 0x01;
 pub const MODIFIER_CTRL: u8 = 0x02;
 pub const MODIFIER_ALT: u8 = 0x04;
 pub const MODIFIER_META: u8 = 0x08;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+    Av1,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VideoBitDepth {
+    #[default]
+    Eight,
+    Ten,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VideoColorSpace {
+    Rec601,
+    #[default]
+    Rec709,
+    Rec2020,
+    Unknown(i32),
+}
+
+impl VideoColorSpace {
+    #[must_use]
+    pub const fn from_native(value: i32) -> Self {
+        match value {
+            0 => Self::Rec601,
+            1 => Self::Rec709,
+            2 => Self::Rec2020,
+            value => Self::Unknown(value),
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rec601 => "Rec. 601",
+            Self::Rec709 => "Rec. 709",
+            Self::Rec2020 => "BT.2020",
+            Self::Unknown(_) => "Unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HdrMetadata {
+    pub display_primaries_x: [u16; 3],
+    pub display_primaries_y: [u16; 3],
+    pub white_point_x: u16,
+    pub white_point_y: u16,
+    pub max_display_luminance: u16,
+    pub min_display_luminance: u16,
+    pub max_content_light_level: u16,
+    pub max_frame_average_light_level: u16,
+    pub max_full_frame_luminance: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VideoColorInfo {
+    pub hdr_active: bool,
+    pub color_space: VideoColorSpace,
+    pub hdr_metadata: Option<HdrMetadata>,
+}
+
+impl VideoBitDepth {
+    #[must_use]
+    pub const fn from_native_format(format: i32) -> Self {
+        if format & VIDEO_FORMAT_MASK_10_BIT != 0 {
+            Self::Ten
+        } else {
+            Self::Eight
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Eight => "8-bit",
+            Self::Ten => "10-bit Main10",
+        }
+    }
+}
+
+impl VideoCodec {
+    #[must_use]
+    pub const fn from_native_format(format: i32) -> Option<Self> {
+        if format & VIDEO_FORMAT_MASK_AV1 != 0 {
+            Some(Self::Av1)
+        } else if format & VIDEO_FORMAT_MASK_HEVC != 0 {
+            Some(Self::Hevc)
+        } else if format & VIDEO_FORMAT_MASK_H264 != 0 {
+            Some(Self::H264)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+            Self::Av1 => "AV1",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionQuality {
@@ -60,6 +179,7 @@ pub struct StreamConfig {
     pub gfe_version: Option<String>,
     pub rtsp_session_url: Option<String>,
     pub server_codec_mode_support: i32,
+    pub supported_video_formats: i32,
     pub width: i32,
     pub height: i32,
     pub fps: i32,
@@ -67,6 +187,7 @@ pub struct StreamConfig {
     pub packet_size: i32,
     pub audio_configuration: i32,
     pub client_refresh_rate_x100: i32,
+    pub hdr_enabled: bool,
     pub remote_input_key: [u8; 16],
     pub remote_input_iv: [u8; 16],
 }
@@ -83,6 +204,7 @@ pub enum StreamEvent {
     Connected,
     Terminated(i32),
     ConnectionStatus(ConnectionQuality),
+    HdrModeChanged(VideoColorInfo),
     VideoSetup {
         format: i32,
         width: i32,
@@ -93,6 +215,7 @@ pub enum StreamEvent {
         bytes: Vec<u8>,
         key_frame: bool,
         presentation_time_us: u64,
+        color: VideoColorInfo,
     },
     AudioSetup {
         sample_rate: i32,
@@ -193,7 +316,48 @@ mod tests {
 
     use crossbeam_channel::{bounded, unbounded};
 
-    use super::{ConnectionQuality, EventReceiver, StreamEvent};
+    use super::{
+        ConnectionQuality, EventReceiver, StreamEvent, VIDEO_FORMAT_AV1, VIDEO_FORMAT_AV1_MAIN10,
+        VIDEO_FORMAT_H264, VIDEO_FORMAT_HEVC, VIDEO_FORMAT_HEVC_MAIN10, VideoBitDepth, VideoCodec,
+        VideoColorInfo,
+    };
+
+    #[test]
+    fn native_video_formats_map_to_supported_codec_families() {
+        assert_eq!(
+            VideoCodec::from_native_format(VIDEO_FORMAT_H264),
+            Some(VideoCodec::H264)
+        );
+        assert_eq!(
+            VideoCodec::from_native_format(VIDEO_FORMAT_HEVC),
+            Some(VideoCodec::Hevc)
+        );
+        assert_eq!(
+            VideoCodec::from_native_format(VIDEO_FORMAT_AV1),
+            Some(VideoCodec::Av1)
+        );
+        assert_eq!(VideoCodec::from_native_format(0), None);
+    }
+
+    #[test]
+    fn native_video_formats_preserve_main10_bit_depth() {
+        assert_eq!(
+            VideoBitDepth::from_native_format(VIDEO_FORMAT_HEVC),
+            VideoBitDepth::Eight
+        );
+        assert_eq!(
+            VideoBitDepth::from_native_format(VIDEO_FORMAT_AV1),
+            VideoBitDepth::Eight
+        );
+        assert_eq!(
+            VideoBitDepth::from_native_format(VIDEO_FORMAT_HEVC_MAIN10),
+            VideoBitDepth::Ten
+        );
+        assert_eq!(
+            VideoBitDepth::from_native_format(VIDEO_FORMAT_AV1_MAIN10),
+            VideoBitDepth::Ten
+        );
+    }
 
     #[test]
     fn audio_is_received_before_droppable_video() {
@@ -211,6 +375,7 @@ mod tests {
                 bytes: vec![1],
                 key_frame: true,
                 presentation_time_us: 0,
+                color: VideoColorInfo::default(),
             })
             .expect("video receiver should remain connected");
         audio_sender
@@ -247,6 +412,7 @@ mod tests {
                 bytes: vec![1],
                 key_frame: true,
                 presentation_time_us: 0,
+                color: VideoColorInfo::default(),
             })
             .expect("video receiver should remain connected");
 
@@ -285,6 +451,7 @@ mod tests {
                 bytes: vec![1],
                 key_frame: true,
                 presentation_time_us: 0,
+                color: VideoColorInfo::default(),
             })
             .expect("video receiver should remain connected");
 
@@ -320,6 +487,7 @@ mod tests {
                 bytes: vec![1],
                 key_frame: true,
                 presentation_time_us: 0,
+                color: VideoColorInfo::default(),
             })
             .expect("video receiver should remain connected");
         control_sender

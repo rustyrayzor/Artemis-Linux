@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_channel::{Sender, TrySendError, bounded, unbounded};
 
 use crate::{
-    ConnectionQuality, Error, EventReceiver, MediaIngressStats, NetworkStats, Result, StreamConfig,
-    StreamEvent,
+    ConnectionQuality, Error, EventReceiver, HdrMetadata, MediaIngressStats, NetworkStats, Result,
+    StreamConfig, StreamEvent, VideoColorInfo, VideoColorSpace,
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -25,6 +25,7 @@ struct NativeStartConfig {
     gfe_version: *const c_char,
     rtsp_session_url: *const c_char,
     server_codec_mode_support: i32,
+    supported_video_formats: i32,
     width: i32,
     height: i32,
     fps: i32,
@@ -32,6 +33,7 @@ struct NativeStartConfig {
     packet_size: i32,
     audio_configuration: i32,
     client_refresh_rate_x100: i32,
+    hdr_enabled: i32,
     remote_input_key: [u8; 16],
     remote_input_iv: [u8; 16],
 }
@@ -41,7 +43,23 @@ type ConnectedCallback = extern "C" fn(*mut c_void);
 type TerminatedCallback = extern "C" fn(*mut c_void, i32);
 type ConnectionStatusCallback = extern "C" fn(*mut c_void, i32);
 type VideoSetupCallback = extern "C" fn(*mut c_void, i32, i32, i32, i32) -> i32;
-type VideoFrameCallback = extern "C" fn(*mut c_void, *const u8, usize, i32, u64);
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NativeHdrMetadata {
+    display_primaries_x: [u16; 3],
+    display_primaries_y: [u16; 3],
+    white_point_x: u16,
+    white_point_y: u16,
+    max_display_luminance: u16,
+    min_display_luminance: u16,
+    max_content_light_level: u16,
+    max_frame_average_light_level: u16,
+    max_full_frame_luminance: u16,
+}
+
+type HdrModeCallback = extern "C" fn(*mut c_void, i32, *const NativeHdrMetadata);
+type VideoFrameCallback =
+    extern "C" fn(*mut c_void, *const u8, usize, i32, u64, i32, i32, *const NativeHdrMetadata);
 type AudioSetupCallback =
     extern "C" fn(*mut c_void, i32, i32, i32, i32, i32, *const u8, usize) -> i32;
 type AudioPacketCallback = extern "C" fn(*mut c_void, *const u8, usize);
@@ -53,6 +71,7 @@ struct NativeCallbacks {
     connected: Option<ConnectedCallback>,
     terminated: Option<TerminatedCallback>,
     connection_status: Option<ConnectionStatusCallback>,
+    hdr_mode: Option<HdrModeCallback>,
     video_setup: Option<VideoSetupCallback>,
     video_frame: Option<VideoFrameCallback>,
     audio_setup: Option<AudioSetupCallback>,
@@ -93,6 +112,13 @@ unsafe extern "C" {
         stats: *mut NativeNetworkStats,
     ) -> i32;
     fn aml_mouse_move(session: *mut NativeSession, x: i16, y: i16) -> i32;
+    fn aml_mouse_move_as_position(
+        session: *mut NativeSession,
+        x: i16,
+        y: i16,
+        reference_width: i16,
+        reference_height: i16,
+    ) -> i32;
     fn aml_mouse_button(session: *mut NativeSession, action: u8, button: i32) -> i32;
     fn aml_scroll(session: *mut NativeSession, vertical: i16, horizontal: i16) -> i32;
     fn aml_keyboard(
@@ -222,6 +248,7 @@ impl Session {
                 .as_ref()
                 .map_or(std::ptr::null(), |value| value.as_ptr()),
             server_codec_mode_support: config.server_codec_mode_support,
+            supported_video_formats: config.supported_video_formats,
             width: config.width,
             height: config.height,
             fps: config.fps,
@@ -229,6 +256,7 @@ impl Session {
             packet_size: config.packet_size,
             audio_configuration: config.audio_configuration,
             client_refresh_rate_x100: config.client_refresh_rate_x100,
+            hdr_enabled: i32::from(config.hdr_enabled),
             remote_input_key: config.remote_input_key,
             remote_input_iv: config.remote_input_iv,
         };
@@ -254,6 +282,7 @@ impl Session {
             connected: Some(on_connected),
             terminated: Some(on_terminated),
             connection_status: Some(on_connection_status),
+            hdr_mode: Some(on_hdr_mode),
             video_setup: Some(on_video_setup),
             video_frame: Some(on_video_frame),
             audio_setup: Some(on_audio_setup),
@@ -315,6 +344,25 @@ impl Session {
     pub fn mouse_move(&mut self, x: i16, y: i16) -> Result<()> {
         // SAFETY: The native handle is valid and the C shim validates active state.
         check(unsafe { aml_mouse_move(self.native.as_ptr(), x, y) })
+    }
+
+    pub fn mouse_move_as_position(
+        &mut self,
+        x: i16,
+        y: i16,
+        reference_width: i16,
+        reference_height: i16,
+    ) -> Result<()> {
+        // SAFETY: The native handle is valid and all dimensions are copied protocol integers.
+        check(unsafe {
+            aml_mouse_move_as_position(
+                self.native.as_ptr(),
+                x,
+                y,
+                reference_width,
+                reference_height,
+            )
+        })
     }
 
     pub fn mouse_button(&mut self, action: u8, button: i32) -> Result<()> {
@@ -482,6 +530,43 @@ extern "C" fn on_connection_status(userdata: *mut c_void, status: i32) {
     }));
 }
 
+fn hdr_metadata(pointer: *const NativeHdrMetadata) -> Option<HdrMetadata> {
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: Native callbacks pass either null or a pointer to an initialized metadata value
+    // that remains valid for the duration of the callback. The plain fields are copied here.
+    let metadata = unsafe { *pointer };
+    Some(HdrMetadata {
+        display_primaries_x: metadata.display_primaries_x,
+        display_primaries_y: metadata.display_primaries_y,
+        white_point_x: metadata.white_point_x,
+        white_point_y: metadata.white_point_y,
+        max_display_luminance: metadata.max_display_luminance,
+        min_display_luminance: metadata.min_display_luminance,
+        max_content_light_level: metadata.max_content_light_level,
+        max_frame_average_light_level: metadata.max_frame_average_light_level,
+        max_full_frame_luminance: metadata.max_full_frame_luminance,
+    })
+}
+
+extern "C" fn on_hdr_mode(userdata: *mut c_void, active: i32, metadata: *const NativeHdrMetadata) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(context) = callback_context(userdata) {
+            let color = VideoColorInfo {
+                hdr_active: active != 0,
+                color_space: if active != 0 {
+                    VideoColorSpace::Rec2020
+                } else {
+                    VideoColorSpace::Rec709
+                },
+                hdr_metadata: hdr_metadata(metadata),
+            };
+            let _ = context.control.send(StreamEvent::HdrModeChanged(color));
+        }
+    }));
+}
+
 extern "C" fn on_video_setup(
     userdata: *mut c_void,
     format: i32,
@@ -512,6 +597,9 @@ extern "C" fn on_video_frame(
     length: usize,
     frame_type: i32,
     presentation_time_us: u64,
+    hdr_active: i32,
+    color_space: i32,
+    metadata: *const NativeHdrMetadata,
 ) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let Some(context) = callback_context(userdata) else {
@@ -527,6 +615,11 @@ extern "C" fn on_video_frame(
             bytes,
             key_frame: frame_type == 1,
             presentation_time_us,
+            color: VideoColorInfo {
+                hdr_active: hdr_active != 0,
+                color_space: VideoColorSpace::from_native(color_space),
+                hdr_metadata: hdr_metadata(metadata),
+            },
         });
     }));
 }
@@ -593,7 +686,7 @@ mod tests {
     use crossbeam_channel::{bounded, unbounded};
 
     use super::CallbackContext;
-    use crate::StreamEvent;
+    use crate::{StreamEvent, VideoColorInfo};
 
     #[test]
     fn media_ingress_counts_video_queue_drops() {
@@ -615,11 +708,13 @@ mod tests {
             bytes: vec![1, 2],
             key_frame: true,
             presentation_time_us: 1,
+            color: VideoColorInfo::default(),
         });
         context.send_video(StreamEvent::VideoFrame {
             bytes: vec![3, 4, 5],
             key_frame: false,
             presentation_time_us: 2,
+            color: VideoColorInfo::default(),
         });
         context.send_audio(StreamEvent::AudioPacket(vec![6, 7, 8, 9]));
 

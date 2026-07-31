@@ -1,0 +1,93 @@
+diff --git a/libweston/color-lcms/color-profile.c b/libweston/color-lcms/color-profile.c
+index d3c60db..3eb2edb 100644
+--- a/libweston/color-lcms/color-profile.c
++++ b/libweston/color-lcms/color-profile.c
+@@ -30,6 +30,7 @@
+ #include "color.h"
+ #include "color-lcms.h"
+ #include "color-management.h"
++#include "color-properties.h"
+ #include "shared/helpers.h"
+ #include "shared/string-helpers.h"
+ #include "shared/xalloc.h"
+@@ -558,57 +559,37 @@ make_icc_file_description(struct lcmsProfilePtr profile,
+  * expected sRGB display response.
+  */
+ bool
+ cmlcms_create_stock_profile(struct weston_color_manager_lcms *cm)
+ {
+-	static const cmsCIExyY D65 = { 0.3127, 0.3290, 1.0 };
+-	static const cmsCIExyYTRIPLE bt709 = {
+-		{ 0.6400, 0.3300, 1.0 },
+-		{ 0.3000, 0.6000, 1.0 },
+-		{ 0.1500, 0.0600, 1.0 }
+-	};
+-	cmsToneCurve *gamma22[3];
+-	struct lcmsProfilePtr profile = { NULL };
+-	struct cmlcms_md5_sum md5sum;
+-	char *desc = NULL;
+-	const char *err_msg = NULL;
+-
+-	gamma22[0] = gamma22[1] = gamma22[2] = cmsBuildGamma(cm->lcms_ctx, 2.2);
+-	if (gamma22[0])
+-		profile.p = cmsCreateRGBProfileTHR(cm->lcms_ctx, &D65, &bt709, gamma22);
+-	cmsFreeToneCurve(gamma22[0]);
+-	if (!profile.p) {
+-		weston_log("color-lcms: error: failed to create stock sRGB profile.\n");
+-		return false;
+-	}
+-	if (!cmsMD5computeID(profile.p)) {
+-		weston_log("Failed to compute MD5 for stock sRGB profile.\n");
+-		goto err_close;
+-	}
+-
+-	cmsGetHeaderProfileID(profile.p, md5sum.bytes);
+-	desc = make_icc_file_description(profile, &md5sum, "sRGB stock");
+-	if (!desc)
+-		goto err_close;
+-
+-	cm->sRGB_profile = cmlcms_color_profile_alloc(cm, CMLCMS_PROFILE_TYPE_ICC, desc);
+-	cm->sRGB_profile->icc.profile = profile;
+-	cm->sRGB_profile->icc.md5sum = md5sum;
+-
+-	if (!ensure_output_profile_extract(cm->sRGB_profile, cm->lcms_ctx,
+-					   cmlcms_reasonable_1D_points(), &err_msg))
+-		goto err_close;
++	const struct weston_color_primaries_info *primaries_info;
++	struct weston_color_profile_params params = { 0 };
++	char *desc;
++
++	primaries_info = weston_color_primaries_info_from(cm->base.compositor,
++							  WESTON_PRIMARIES_CICP_SRGB);
++	params.primaries = primaries_info->color_gamut;
++	params.primaries_info = primaries_info;
++	params.tf.info = weston_color_tf_info_from(cm->base.compositor,
++						  WESTON_TF_GAMMA22);
++	params.min_luminance = 0.2f;
++	params.reference_white_luminance = 80.0f;
++	params.max_luminance = 80.0f;
++	params.target_primaries = params.primaries;
++	params.target_min_luminance = params.min_luminance;
++	params.target_max_luminance = params.max_luminance;
++	params.maxCLL = -1.0f;
++	params.maxFALL = -1.0f;
++
++	desc = xstrdup("Parametric sRGB stock");
++	cm->sRGB_profile = cmlcms_color_profile_alloc(cm,
++						       CMLCMS_PROFILE_TYPE_PARAMS,
++						       desc);
++	*cm->sRGB_profile->params = params;
+ 
+ 	cmlcms_color_profile_register(cm->sRGB_profile);
+ 
+ 	return true;
+-
+-err_close:
+-	if (err_msg)
+-		weston_log("%s\n", err_msg);
+-
+-	cmlcms_color_profile_destroy(cm->sRGB_profile);
+-	return false;
+ }
+ 
+ struct weston_color_profile *

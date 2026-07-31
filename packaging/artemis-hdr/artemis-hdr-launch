@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+export PATH="/home/ray-svc/.local/bin:$PATH"
+export RUST_LOG="artemis=info,artemis_core=info,artemis_moonlight=info"
+export ARTEMIS_COMPOSITOR_VSYNC="1"
+
+exec /home/ray-svc/.local/bin/artemis-linux

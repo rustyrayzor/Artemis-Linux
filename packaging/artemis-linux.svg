@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Artemis Linux">
+  <rect width="512" height="512" rx="104" fill="#4256b8"/>
+  <rect x="90" y="112" width="332" height="228" rx="28" fill="#eef1f8"/>
+  <rect x="116" y="138" width="280" height="176" rx="12" fill="#1c1e25"/>
+  <path d="M214 340h84l18 54h52v28H144v-28h52z" fill="#eef1f8"/>
+  <path d="M226 188l92 38-92 38z" fill="#6597e1"/>
+</svg>

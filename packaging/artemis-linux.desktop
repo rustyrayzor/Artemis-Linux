@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Artemis Linux
+Comment=Stream applications from Apollo and Sunshine hosts
+Exec=artemis-linux %u
+Icon=artemis-linux
+Terminal=false
+Categories=Game;Network;
+MimeType=x-scheme-handler/art;
+StartupNotify=true

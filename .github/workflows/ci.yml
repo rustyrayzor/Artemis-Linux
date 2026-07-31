@@ -42,20 +42,53 @@ jobs:
       - name: Release build
         run: cargo build --workspace --release
 
-      - name: Package release binary
+      - name: Validate installation scripts
         run: |
-          mkdir -p dist
-          cp target/release/artemis-linux dist/
-          (
-            cd dist
-            sha256sum artemis-linux > artemis-linux.sha256
-          )
-          tar -C dist -czf artemis-linux-x86_64-ubuntu-24.04.tar.gz \
-            artemis-linux artemis-linux.sha256
+          sh -n packaging/install.sh packaging/rollback.sh packaging/validate-beta.sh
+          test_home=$(mktemp -d)
+          HOME="$test_home" ARTEMIS_BINARY="$PWD/target/release/artemis-linux" \
+            ARTEMIS_SKIP_DESKTOP_DATABASE=1 sh packaging/install.sh
+          HOME="$test_home" ARTEMIS_SKIP_DESKTOP_DATABASE=1 sh packaging/rollback.sh
+          test ! -e "$test_home/.local/bin/artemis-linux"
+          rm -rf -- "$test_home"
 
-      - name: Upload release binary
+      - name: Package release bundle
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | \
+            jq -r '.packages[] | select(.name == "artemis-app") | .version')
+          package="artemis-linux-$version-x86_64-ubuntu-24.04"
+          mkdir -p "dist/$package/bin" "dist/$package/packaging"
+          cp target/release/artemis-linux "dist/$package/bin/"
+          cp packaging/artemis-linux.desktop packaging/artemis-linux.svg \
+            packaging/install.sh packaging/rollback.sh packaging/validate-beta.sh \
+            "dist/$package/packaging/"
+          cp README.md LICENSE "dist/$package/"
+          chmod +x "dist/$package/bin/artemis-linux" \
+            "dist/$package/packaging/"*.sh
+          (
+            cd "dist/$package"
+            sha256sum bin/artemis-linux > artemis-linux.sha256
+          )
+          tar -C dist -czf "$package.tar.gz" "$package"
+
+      - name: Upload release bundle
         uses: actions/upload-artifact@v7
         with:
           name: artemis-linux-${{ github.sha }}
-          path: artemis-linux-x86_64-ubuntu-24.04.tar.gz
+          path: artemis-linux-*-x86_64-ubuntu-24.04.tar.gz
           if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: artemis-linux-${{ github.sha }}
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" ./*.tar.gz --generate-notes --verify-tag

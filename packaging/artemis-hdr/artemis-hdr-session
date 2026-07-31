@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+export LD_LIBRARY_PATH="/opt/artemis-hdr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+exec /opt/artemis-hdr/bin/weston \
+    --backend=drm \
+    --renderer=gl \
+    --shell=kiosk-shell.so \
+    --config=/etc/xdg/weston/artemis-hdr.ini \
+    --drm-device=card1 \
+    --continue-without-input

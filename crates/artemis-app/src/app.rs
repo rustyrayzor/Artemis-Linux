@@ -1,37 +1,59 @@
+mod artwork;
+mod browser;
+
 use std::thread;
 use std::time::{Duration, Instant};
 
 use artemis_core::{
-    Application, ClientIdentity, HostAddress, HostRecord, HostStore, LaunchResult, NvClient,
-    PairingOutcome, ServerInfo, StreamBitrate, StreamPreset, cancel_host_application, discover,
-    generate_pin, launch_application, list_applications, pair, stereo_audio_configuration,
+    Application, ClientIdentity, HostAddress, HostRecord, HostStore, LaunchOptions, LaunchResult,
+    NvClient, PairingOutcome, ServerInfo, StreamBitrate, StreamFrameRate, StreamPreset,
+    cancel_host_application, discover, generate_pin, launch_application, list_applications, pair,
 };
-use artemis_moonlight::{ConnectionQuality, EventReceiver, Session, StreamConfig, StreamEvent};
+use artemis_moonlight::{
+    ConnectionQuality, EventReceiver, Session, StreamConfig, StreamEvent, VIDEO_FORMAT_AV1,
+    VIDEO_FORMAT_AV1_MAIN10, VIDEO_FORMAT_H264, VIDEO_FORMAT_HEVC, VIDEO_FORMAT_HEVC_MAIN10,
+    VideoCodec,
+};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{self, Color32, RichText};
 
-use crate::controller::ControllerManager;
-use crate::input::InputRouter;
-use crate::media::{DecodedFrame, GlInteropContext, MediaRuntime, StreamDiagnostics};
+use self::artwork::{ArtworkKey, ArtworkStore, DecodedArtwork};
+use self::browser::{BrowserDialog, BrowserPage, BrowserState};
+use crate::controller::{ControllerManager, ControllerPreferences};
+use crate::deep_link::ApolloLaunchRequest;
+use crate::input::{InputPreferences, InputRouter};
+use crate::media::{
+    DecodedFrame, DecoderCapabilities, GlInteropContext, HdrDisplayCapabilities, MediaRuntime,
+    StreamDiagnostics, decoder_capabilities, hdr_display_capabilities,
+};
+use crate::settings::{
+    AppSettings, BitrateMode, StreamDisplayMode, VideoBitDepthPreference, VideoCodecPreference,
+    recommended_bitrate_mbps, recommended_bitrate_mbps_for_range,
+};
 use crate::video_texture::StreamTexture;
 
 const DEFAULT_HTTP_PORT: u16 = 47_989;
 const AUTOSTART_HOST_ENV: &str = "ARTEMIS_AUTOSTART_HOST";
 const AUTOSTART_APP_ENV: &str = "ARTEMIS_AUTOSTART_APP";
 const AUTOSTART_PRESET_ENV: &str = "ARTEMIS_AUTOSTART_PRESET";
+const AUTOSTART_FPS_ENV: &str = "ARTEMIS_AUTOSTART_FPS";
 const AUTOSTART_BITRATE_ENV: &str = "ARTEMIS_AUTOSTART_BITRATE_MBPS";
+const AUTOSTART_CODEC_ENV: &str = "ARTEMIS_AUTOSTART_CODEC";
 const AUTOSTART_FULLSCREEN_ENV: &str = "ARTEMIS_AUTOSTART_FULLSCREEN";
 const AUTOSTOP_AFTER_ENV: &str = "ARTEMIS_AUTOSTOP_AFTER_SECONDS";
+const AUTOSTOP_CANCEL_HOST_ENV: &str = "ARTEMIS_AUTOSTOP_CANCEL_HOST";
 
 pub struct ArtemisApp {
     identity: ClientIdentity,
     store: HostStore,
+    browser: BrowserState,
     paired_hosts: Vec<HostRecord>,
     discovered_hosts: Vec<artemis_core::DiscoveredHost>,
     selected_address: Option<HostAddress>,
     selected_record: Option<HostRecord>,
     selected_info: Option<ServerInfo>,
     applications: Vec<Application>,
+    artwork: ArtworkStore,
     manual_host: String,
     passphrase: String,
     pairing_pin: Option<String>,
@@ -42,14 +64,18 @@ pub struct ArtemisApp {
     active_stream: Option<ActiveStream>,
     gl_interop: Option<GlInteropContext>,
     texture: Option<StreamTexture>,
-    stream_preset: StreamPreset,
-    stream_bitrate: StreamBitrate,
+    settings: AppSettings,
+    decoder_capabilities: DecoderCapabilities,
+    hdr_display_capabilities: HdrDisplayCapabilities,
     fullscreen: bool,
     diagnostics_overlay: DiagnosticsOverlay,
     pending_autostart: Option<AutostartRequest>,
+    pending_apollo_launch: Option<ApolloLaunchRequest>,
     fullscreen_on_connect: bool,
     autostop_after_connect: Option<Duration>,
     autostop_deadline: Option<Instant>,
+    autostop_action: AutostopAction,
+    cancel_completion: CancelCompletion,
 }
 
 struct ActiveStream {
@@ -71,6 +97,126 @@ enum DiagnosticsOverlay {
     Visible,
 }
 
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum AutostopAction {
+    #[default]
+    Disconnect,
+    CancelHost,
+}
+
+impl AutostopAction {
+    const fn cancel_host(self) -> bool {
+        matches!(self, Self::CancelHost)
+    }
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum CancelCompletion {
+    #[default]
+    RemainOpen,
+    CloseApplication,
+}
+
+impl VideoCodecPreference {
+    fn supported_video_formats(
+        self,
+        bit_depth: VideoBitDepthPreference,
+        capabilities: DecoderCapabilities,
+    ) -> i32 {
+        if bit_depth == VideoBitDepthPreference::TenBit {
+            return match self {
+                Self::Automatic | Self::Av1 => {
+                    let mut formats = 0;
+                    if capabilities.main10_ready(VideoCodec::Av1) {
+                        formats |= VIDEO_FORMAT_AV1_MAIN10;
+                    }
+                    if capabilities.main10_ready(VideoCodec::Hevc) {
+                        formats |= VIDEO_FORMAT_HEVC_MAIN10;
+                    }
+                    formats
+                }
+                Self::Hevc => {
+                    if capabilities.main10_ready(VideoCodec::Hevc) {
+                        VIDEO_FORMAT_HEVC_MAIN10
+                    } else {
+                        0
+                    }
+                }
+                Self::H264 => 0,
+            };
+        }
+        let mut formats = 0;
+        let h264 = capabilities.support(VideoCodec::H264);
+        let hevc = capabilities.support(VideoCodec::Hevc);
+        let av1 = capabilities.support(VideoCodec::Av1);
+
+        match self {
+            Self::Automatic => {
+                if av1.hardware {
+                    formats |= VIDEO_FORMAT_AV1;
+                }
+                if hevc.hardware {
+                    formats |= VIDEO_FORMAT_HEVC;
+                }
+                if h264.available {
+                    formats |= VIDEO_FORMAT_H264;
+                }
+                if formats == 0 {
+                    if av1.available {
+                        formats |= VIDEO_FORMAT_AV1;
+                    } else if hevc.available {
+                        formats |= VIDEO_FORMAT_HEVC;
+                    }
+                }
+            }
+            Self::Av1 => {
+                if av1.available {
+                    formats |= VIDEO_FORMAT_AV1;
+                }
+                if hevc.available {
+                    formats |= VIDEO_FORMAT_HEVC;
+                }
+                if h264.available {
+                    formats |= VIDEO_FORMAT_H264;
+                }
+            }
+            Self::Hevc => {
+                if hevc.available {
+                    formats |= VIDEO_FORMAT_HEVC;
+                }
+                if h264.available {
+                    formats |= VIDEO_FORMAT_H264;
+                }
+            }
+            Self::H264 => {
+                if h264.available {
+                    formats |= VIDEO_FORMAT_H264;
+                }
+            }
+        }
+        formats
+    }
+
+    fn bitrate_preference(self, capabilities: DecoderCapabilities) -> Self {
+        if self != Self::Automatic {
+            return self;
+        }
+        if capabilities.av1.hardware {
+            Self::Av1
+        } else if capabilities.hevc.hardware {
+            Self::Hevc
+        } else if capabilities.h264.available {
+            Self::H264
+        } else if capabilities.av1.available {
+            Self::Av1
+        } else if capabilities.hevc.available {
+            Self::Hevc
+        } else {
+            Self::H264
+        }
+    }
+}
+
 impl DiagnosticsOverlay {
     fn is_visible(self) -> bool {
         self == Self::Visible
@@ -83,6 +229,10 @@ impl DiagnosticsOverlay {
             Self::Visible
         };
     }
+
+    fn from_visible(visible: bool) -> Self {
+        if visible { Self::Visible } else { Self::Hidden }
+    }
 }
 
 #[derive(Debug)]
@@ -90,9 +240,25 @@ struct AutostartRequest {
     address: HostAddress,
     application_title: String,
     preset: StreamPreset,
-    bitrate: StreamBitrate,
+    frame_rate: StreamFrameRate,
+    bitrate_override: Option<StreamBitrate>,
+    codec: VideoCodecPreference,
     fullscreen: bool,
     autostop_after: Option<Duration>,
+    autostop_cancel_host: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct AutostartValues<'a> {
+    host: Option<&'a str>,
+    application: Option<&'a str>,
+    preset: Option<&'a str>,
+    frame_rate: Option<&'a str>,
+    bitrate_mbps: Option<&'a str>,
+    codec: Option<&'a str>,
+    fullscreen: Option<&'a str>,
+    autostop_after_seconds: Option<&'a str>,
+    autostop_cancel_host: Option<&'a str>,
 }
 
 enum TaskMessage {
@@ -104,9 +270,15 @@ enum TaskMessage {
     },
     Paired(std::result::Result<(HostRecord, ServerInfo), String>),
     Applications(std::result::Result<(HostRecord, Vec<Application>), String>),
+    ArtworkLoaded {
+        result: std::result::Result<DecodedArtwork, (ArtworkKey, String)>,
+    },
     Launched {
         record: HostRecord,
         title: String,
+        supported_video_formats: i32,
+        codec_label: &'static str,
+        bit_depth_label: &'static str,
         result: std::result::Result<LaunchResult, String>,
     },
     NativeConnected {
@@ -115,7 +287,89 @@ enum TaskMessage {
         profile_label: String,
         result: std::result::Result<(Session, EventReceiver), String>,
     },
+    NetworkTested {
+        title: String,
+        result: std::result::Result<String, String>,
+    },
     Cancelled(std::result::Result<(), String>),
+}
+
+fn load_app_settings(config_dir: &std::path::Path) -> (AppSettings, Option<String>) {
+    match AppSettings::load(config_dir) {
+        Ok(settings) => (settings, None),
+        Err(error) => {
+            tracing::warn!(%error, "using default application settings");
+            (AppSettings::default(), Some(error))
+        }
+    }
+}
+
+fn apply_autostart_settings(
+    settings: &mut AppSettings,
+    pending_autostart: Option<&AutostartRequest>,
+    capabilities: DecoderCapabilities,
+) {
+    let Some(request) = pending_autostart else {
+        return;
+    };
+    settings.resolution = request.preset;
+    settings.frame_rate = request.frame_rate;
+    settings.video_codec = request.codec;
+    settings.bitrate_mode = if request.bitrate_override.is_some() {
+        BitrateMode::Custom
+    } else {
+        BitrateMode::Balanced
+    };
+    settings.bitrate_mbps = request.bitrate_override.map_or_else(
+        || {
+            recommended_bitrate_mbps_for_range(
+                request.preset,
+                request.frame_rate,
+                request.codec.bitrate_preference(capabilities),
+                settings.video_bit_depth,
+            )
+            .unwrap_or_else(|| {
+                recommended_bitrate_mbps(
+                    request.preset,
+                    request.frame_rate,
+                    request.codec.bitrate_preference(capabilities),
+                )
+            })
+        },
+        StreamBitrate::mbps,
+    );
+    settings.display_mode = if request.fullscreen {
+        StreamDisplayMode::Fullscreen
+    } else {
+        StreamDisplayMode::Windowed
+    };
+}
+
+fn initialize_gl_interop(context: &eframe::CreationContext<'_>) -> Option<GlInteropContext> {
+    match GlInteropContext::new(context) {
+        Ok(Some(context)) => {
+            tracing::info!(
+                target: "artemis::media",
+                "EGL video interop is available"
+            );
+            Some(context)
+        }
+        Ok(None) => {
+            tracing::info!(
+                target: "artemis::media",
+                "EGL video interop is unavailable; using CPU video upload"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "artemis::media",
+                %error,
+                "could not initialize EGL video interop; using CPU video upload"
+            );
+            None
+        }
+    }
 }
 
 impl ArtemisApp {
@@ -123,90 +377,140 @@ impl ArtemisApp {
         context: &eframe::CreationContext<'_>,
         identity: ClientIdentity,
         store: HostStore,
+        start_in_settings: bool,
+        apollo_launch: std::result::Result<Option<ApolloLaunchRequest>, String>,
     ) -> Self {
         configure_style(&context.egui_ctx);
         let paired_hosts = store.load().unwrap_or_default();
+        let mut browser = BrowserState::load(identity.config_dir());
+        if start_in_settings {
+            browser.page = BrowserPage::Settings;
+        }
+        let (mut settings, settings_error) = load_app_settings(identity.config_dir());
         let (tasks, task_results) = unbounded();
-        let (pending_autostart, autostart_error) = match autostart_from_environment() {
+        let (pending_apollo_launch, apollo_launch_error) = match apollo_launch {
+            Ok(request) => (request, None),
+            Err(error) => {
+                tracing::warn!(%error, "ignoring invalid Apollo WebUI launch link");
+                (None, Some(error))
+            }
+        };
+        let (mut pending_autostart, mut autostart_error) = match autostart_from_environment() {
             Ok(request) => (request, None),
             Err(error) => {
                 tracing::warn!(%error, "ignoring invalid diagnostic autostart configuration");
                 (None, Some(error))
             }
         };
-        let stream_preset = pending_autostart
+        if pending_apollo_launch.is_some() {
+            pending_autostart = None;
+            autostart_error = None;
+        }
+        let gl_interop = initialize_gl_interop(context);
+        let mut decoder_capabilities = decoder_capabilities();
+        decoder_capabilities.presentation_bit_depth = gl_interop
             .as_ref()
-            .map_or_else(StreamPreset::default, |request| request.preset);
-        let stream_bitrate = pending_autostart.as_ref().map_or_else(
-            || stream_preset.default_bitrate(),
-            |request| request.bitrate,
+            .map_or(8, GlInteropContext::presentation_bit_depth);
+        trace_decoder_capabilities(decoder_capabilities);
+        let hdr_display_capabilities = hdr_display_capabilities();
+        tracing::info!(
+            target: "artemis::media",
+            output = ?hdr_display_capabilities.output_name,
+            display_hdr10 = hdr_display_capabilities.display_hdr10,
+            native_hdr_presentation = hdr_display_capabilities.native_hdr_presentation,
+            reason = %hdr_display_capabilities.presentation_reason,
+            "HDR display capability probe complete"
         );
-        let gl_interop = match GlInteropContext::new(context) {
-            Ok(Some(context)) => {
-                tracing::info!(
-                    target: "artemis::media",
-                    "EGL video interop is available"
-                );
-                Some(context)
-            }
-            Ok(None) => {
-                tracing::info!(
-                    target: "artemis::media",
-                    "EGL video interop is unavailable; using CPU video upload"
-                );
-                None
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "artemis::media",
-                    %error,
-                    "could not initialize EGL video interop; using CPU video upload"
-                );
-                None
-            }
-        };
+        apply_autostart_settings(
+            &mut settings,
+            pending_autostart.as_ref(),
+            decoder_capabilities,
+        );
+        let diagnostics_overlay =
+            DiagnosticsOverlay::from_visible(settings.show_performance_diagnostics);
         let mut app = Self {
             identity,
             store,
+            browser,
             paired_hosts,
             discovered_hosts: Vec::new(),
             selected_address: None,
             selected_record: None,
             selected_info: None,
             applications: Vec::new(),
+            artwork: ArtworkStore::default(),
             manual_host: String::new(),
             passphrase: String::new(),
             pairing_pin: None,
-            status: autostart_error.unwrap_or_else(|| "Ready".to_owned()),
+            status: apollo_launch_error
+                .or(autostart_error)
+                .or(settings_error)
+                .unwrap_or_else(|| "Ready".to_owned()),
             busy: false,
             tasks,
             task_results,
             active_stream: None,
             gl_interop,
             texture: None,
-            stream_preset,
-            stream_bitrate,
+            settings,
+            decoder_capabilities,
+            hdr_display_capabilities,
             fullscreen: false,
-            diagnostics_overlay: DiagnosticsOverlay::Hidden,
+            diagnostics_overlay,
             pending_autostart,
+            pending_apollo_launch,
             fullscreen_on_connect: false,
             autostop_after_connect: None,
             autostop_deadline: None,
+            autostop_action: AutostopAction::Disconnect,
+            cancel_completion: CancelCompletion::RemainOpen,
         };
-        if let Some(request) = &app.pending_autostart {
+        app.begin_initial_navigation();
+        app
+    }
+
+    fn begin_initial_navigation(&mut self) {
+        if let Some(request) = &self.pending_apollo_launch {
+            let record = self
+                .paired_hosts
+                .iter()
+                .find(|record| {
+                    record
+                        .server_unique_id
+                        .eq_ignore_ascii_case(&request.host_uuid)
+                })
+                .cloned();
+            if let Some(record) = record {
+                tracing::info!(
+                    host = %record.name,
+                    host_uuid = %request.host_uuid,
+                    application = %request.application_label(),
+                    "Apollo WebUI launch is configured"
+                );
+                self.inspect(record.address);
+            } else {
+                let host = request.host_name.as_deref().unwrap_or(&request.host_uuid);
+                self.status = format!(
+                    "Apollo requested a launch on {host}, but that host is not paired with Artemis."
+                );
+                self.pending_apollo_launch = None;
+                self.start_discovery();
+            }
+        } else if let Some(request) = &self.pending_autostart {
             tracing::info!(
                 host = %request.address.host,
                 application = %request.application_title,
-                preset = request.preset.label(),
-                bitrate_mbps = request.bitrate.mbps(),
+                resolution = request.preset.resolution_label(),
+                fps = request.frame_rate.fps(),
+                bitrate_mbps = self.settings.bitrate_mbps,
+                codec = request.codec.label(),
                 fullscreen = request.fullscreen,
                 "diagnostic autostart is configured"
             );
-            app.inspect(request.address.clone());
+            self.inspect(request.address.clone());
         } else {
-            app.start_discovery();
+            self.start_discovery();
         }
-        app
     }
 
     fn start_discovery(&mut self) {
@@ -322,18 +626,73 @@ impl ArtemisApp {
         });
     }
 
+    fn refresh_application_artwork(&mut self, record: &HostRecord, applications: &[Application]) {
+        let pending = self
+            .artwork
+            .begin_host_load(&record.server_unique_id, applications);
+        if pending.is_empty() {
+            return;
+        }
+        let record = record.clone();
+        let identity = self.identity.clone();
+        let config_dir = self.identity.config_dir().to_owned();
+        let sender = self.tasks.clone();
+        thread::spawn(move || {
+            let client = NvClient::new(
+                record.address,
+                identity,
+                Some(record.https_port),
+                Some(record.certificate_der),
+            );
+            for application in pending {
+                let key = ArtworkKey::new(&record.server_unique_id, application.id);
+                let result =
+                    artwork::load(&config_dir, &record.server_unique_id, &client, &application)
+                        .map_err(|error| (key, error));
+                if sender.send(TaskMessage::ArtworkLoaded { result }).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     fn launch(&mut self, application: Application) {
         let Some(record) = self.selected_record.clone() else {
             return;
         };
+        let supported_video_formats = self
+            .settings
+            .video_codec
+            .supported_video_formats(self.settings.video_bit_depth, self.decoder_capabilities);
+        if supported_video_formats == 0 {
+            self.status = if self.settings.video_bit_depth == VideoBitDepthPreference::TenBit {
+                format!(
+                    "10-bit Main10 is unavailable for {} on this decoder/display path.",
+                    self.settings.video_codec.label()
+                )
+            } else {
+                "No compatible H.264, HEVC, or AV1 GStreamer decoder is installed.".to_owned()
+            };
+            return;
+        }
         self.busy = true;
-        let preset = self.stream_preset;
-        let bitrate = self.stream_bitrate;
+        let preset = self.settings.resolution;
+        let frame_rate = self.settings.frame_rate;
+        let bitrate = self.settings.bitrate();
+        let codec_label = self.settings.video_codec.label();
+        let bit_depth_label = self.settings.video_bit_depth.label();
+        let launch_options = LaunchOptions {
+            mute_host_audio: self.settings.mute_host_audio,
+            audio_configuration: self.settings.audio_configuration,
+        };
+        self.fullscreen_on_connect = self.settings.display_mode.fullscreen();
         self.status = format!(
-            "Launching {} at {} and {} Mbps…",
+            "Launching {} at {} {}, {} Mbps, using {}…",
             application.title,
-            preset.label(),
-            bitrate.mbps()
+            preset.resolution_label(),
+            frame_rate.label(),
+            bitrate.mbps(),
+            codec_label
         );
         let identity = self.identity.clone();
         let sender = self.tasks.clone();
@@ -344,28 +703,43 @@ impl ArtemisApp {
                 Some(record.https_port),
                 Some(record.certificate_der.clone()),
             );
-            let title = application.title;
+            let title = application.title.clone();
             let result = launch_application(
                 &mut client,
-                application.id,
-                preset.profile_with_bitrate(bitrate),
+                &application,
+                preset.profile_with_bitrate_and_fps(bitrate, frame_rate),
+                launch_options,
             )
             .map_err(|error| error.to_string());
             let _ = sender.send(TaskMessage::Launched {
                 record,
                 title,
+                supported_video_formats,
+                codec_label,
+                bit_depth_label,
                 result,
             });
         });
     }
 
-    fn begin_native_connection(&mut self, record: HostRecord, title: String, launch: LaunchResult) {
+    fn begin_native_connection(
+        &mut self,
+        record: HostRecord,
+        title: String,
+        launch: LaunchResult,
+        supported_video_formats: i32,
+        codec_label: &str,
+        bit_depth_label: &str,
+    ) {
         let profile_label = format!(
-            "{}x{} at {} FPS · {} Mbps",
+            "{}x{} at {} FPS · {} Mbps · {} · {} · {}",
             launch.profile.width(),
             launch.profile.height(),
             launch.profile.fps(),
-            launch.profile.bitrate_kbps() / 1000
+            launch.profile.bitrate_kbps() / 1000,
+            codec_label,
+            bit_depth_label,
+            launch.audio_configuration.label(),
         );
         self.status = format!("Connecting {title} at {profile_label}…");
         let config = StreamConfig {
@@ -374,13 +748,15 @@ impl ArtemisApp {
             gfe_version: launch.server_info.gfe_version,
             rtsp_session_url: launch.rtsp_session_url,
             server_codec_mode_support: launch.server_info.codec_mode_support,
+            supported_video_formats,
             width: launch.profile.width(),
             height: launch.profile.height(),
             fps: launch.profile.fps(),
             bitrate_kbps: launch.profile.bitrate_kbps(),
             packet_size: launch.profile.packet_size(),
-            audio_configuration: stereo_audio_configuration(),
+            audio_configuration: launch.audio_configuration.moonlight_value(),
             client_refresh_rate_x100: launch.profile.fps() * 100,
+            hdr_enabled: self.settings.video_bit_depth == VideoBitDepthPreference::TenBit,
             remote_input_key: *launch.remote_input.key(),
             remote_input_iv: *launch.remote_input.iv(),
         };
@@ -432,10 +808,22 @@ impl ArtemisApp {
                             });
                             self.selected_info = Some(info);
                             if self.selected_record.is_some() {
+                                if self.browser.open_apps_after_inspect
+                                    && self.pending_autostart.is_none()
+                                    && self.pending_apollo_launch.is_none()
+                                {
+                                    self.browser.page = BrowserPage::Applications;
+                                }
                                 self.refresh_applications();
+                            } else if self.browser.open_apps_after_inspect {
+                                self.browser.open_apps_after_inspect = false;
+                                self.browser.dialog = Some(BrowserDialog::PairHost);
                             }
                         }
-                        Err(error) => self.status = error,
+                        Err(error) => {
+                            self.browser.open_apps_after_inspect = false;
+                            self.status = error;
+                        }
                     }
                 }
                 TaskMessage::Paired(result) => {
@@ -448,6 +836,9 @@ impl ArtemisApp {
                             self.paired_hosts = self.store.load().unwrap_or_default();
                             self.selected_record = Some(record);
                             self.selected_info = Some(info);
+                            self.browser.dialog = None;
+                            self.browser.page = BrowserPage::Applications;
+                            self.browser.open_apps_after_inspect = false;
                             self.refresh_applications();
                         }
                         Err(error) => self.status = error,
@@ -462,9 +853,31 @@ impl ArtemisApp {
                                 applications.len(),
                                 record.name
                             );
+                            self.refresh_application_artwork(&record, &applications);
                             self.selected_record = Some(record);
                             self.applications = applications;
-                            if let Some(request) = self.pending_autostart.take() {
+                            if self.pending_autostart.is_none()
+                                && self.pending_apollo_launch.is_none()
+                            {
+                                self.browser.page = BrowserPage::Applications;
+                            }
+                            self.browser.open_apps_after_inspect = false;
+                            if let Some(request) = self.pending_apollo_launch.take() {
+                                let application =
+                                    application_for_apollo_launch(&self.applications, &request);
+                                if let Some(application) = application {
+                                    tracing::info!(
+                                        application = %application.title,
+                                        "launching application requested by Apollo WebUI"
+                                    );
+                                    self.launch(application);
+                                } else {
+                                    self.status = format!(
+                                        "Apollo application '{}' was not found on this host.",
+                                        request.application_label()
+                                    );
+                                }
+                            } else if let Some(request) = self.pending_autostart.take() {
                                 let application = self
                                     .applications
                                     .iter()
@@ -481,6 +894,11 @@ impl ArtemisApp {
                                     );
                                     self.fullscreen_on_connect = request.fullscreen;
                                     self.autostop_after_connect = request.autostop_after;
+                                    self.autostop_action = if request.autostop_cancel_host {
+                                        AutostopAction::CancelHost
+                                    } else {
+                                        AutostopAction::Disconnect
+                                    };
                                     self.launch(application);
                                 } else {
                                     self.status = format!(
@@ -493,13 +911,34 @@ impl ArtemisApp {
                         Err(error) => self.status = error,
                     }
                 }
+                TaskMessage::ArtworkLoaded { result } => match result {
+                    Ok(decoded) => {
+                        self.artwork.finish(context, decoded);
+                        context.request_repaint();
+                    }
+                    Err((key, error)) => {
+                        tracing::warn!(%error, "application artwork is unavailable; using fallback");
+                        self.artwork.fail(key);
+                    }
+                },
                 TaskMessage::Launched {
                     record,
                     title,
+                    supported_video_formats,
+                    codec_label,
+                    bit_depth_label,
                     result,
                 } => match result {
-                    Ok(launch) => self.begin_native_connection(record, title, launch),
+                    Ok(launch) => self.begin_native_connection(
+                        record,
+                        title,
+                        launch,
+                        supported_video_formats,
+                        codec_label,
+                        bit_depth_label,
+                    ),
                     Err(error) => {
+                        tracing::error!(%error, "host application launch failed");
                         self.busy = false;
                         self.status = error;
                     }
@@ -519,6 +958,7 @@ impl ArtemisApp {
                                 audio_events,
                                 video_events,
                                 self.gl_interop.clone(),
+                                self.settings.frame_pacing,
                             ) {
                                 Ok(media) => {
                                     self.status =
@@ -527,8 +967,20 @@ impl ArtemisApp {
                                         session,
                                         events,
                                         media,
-                                        controller: ControllerManager::new(),
-                                        input: InputRouter::new(),
+                                        controller: ControllerManager::new(ControllerPreferences {
+                                            swap_face_buttons: self.settings.swap_gamepad_buttons,
+                                            force_gamepad_one: self.settings.force_gamepad_one,
+                                            background_input: self
+                                                .settings
+                                                .gamepad_background_input,
+                                        }),
+                                        input: InputRouter::new(InputPreferences {
+                                            optimize_mouse_for_desktop: self
+                                                .settings
+                                                .optimize_mouse_for_desktop,
+                                            swap_mouse_buttons: self.settings.swap_mouse_buttons,
+                                            reverse_scrolling: self.settings.reverse_scrolling,
+                                        }),
                                         record,
                                         app_title: title,
                                         profile_label,
@@ -547,21 +999,36 @@ impl ArtemisApp {
                                     );
                                 }
                                 Err(error) => {
+                                    tracing::error!(%error, "media runtime initialization failed");
                                     session.stop();
                                     self.status = error;
                                 }
                             }
                         }
-                        Err(error) => self.status = error,
+                        Err(error) => {
+                            tracing::error!(%error, "native streaming connection failed");
+                            self.status = error;
+                        }
                     }
+                }
+                TaskMessage::NetworkTested { title, result } => {
+                    self.show_network_result(title, result);
                 }
                 TaskMessage::Cancelled(result) => {
                     self.busy = false;
+                    if let Err(error) = &result {
+                        tracing::error!(%error, "host application cancellation failed");
+                    } else {
+                        tracing::info!("host application ended cleanly");
+                    }
                     self.status = result.map_or_else(
                         |error| error,
                         |()| "The host application ended cleanly.".to_owned(),
                     );
-                    if self.selected_record.is_some() {
+                    if self.cancel_completion == CancelCompletion::CloseApplication {
+                        self.cancel_completion = CancelCompletion::RemainOpen;
+                        context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else if self.selected_record.is_some() {
                         self.refresh_applications();
                     }
                 }
@@ -619,42 +1086,38 @@ impl ArtemisApp {
                     "The stream connection is unstable.".clone_into(&mut self.status);
                 }
                 StreamEvent::Terminated(error) => terminated = Some(error),
+                StreamEvent::HdrModeChanged(color) => {
+                    tracing::info!(
+                        target: "artemis::media",
+                        hdr_active = color.hdr_active,
+                        color_space = color.color_space.label(),
+                        hdr_metadata = ?color.hdr_metadata,
+                        "Apollo display HDR mode changed"
+                    );
+                }
                 StreamEvent::VideoSetup { .. }
                 | StreamEvent::VideoFrame { .. }
                 | StreamEvent::AudioSetup { .. }
                 | StreamEvent::AudioPacket(_) => {}
             }
         }
-        if self
-            .autostop_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            tracing::info!("diagnostic autostop deadline reached; disconnecting cleanly");
-            self.autostop_deadline = None;
-            self.disconnect(context, false);
-            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        if self.handle_autostop(context) {
             return;
         }
 
+        let window_focused = context.input(|input| input.viewport().focused.unwrap_or(true));
         if let Some(active) = &mut self.active_stream {
-            active.controller.poll(&mut active.session);
+            active
+                .media
+                .set_audio_muted(self.settings.mute_audio_when_inactive && !window_focused);
+            active.controller.poll(&mut active.session, window_focused);
             if active.connected {
                 active
                     .input
                     .forward(context, &mut active.session, suppress_escape);
             }
         }
-        let decoded_frame = self
-            .active_stream
-            .as_ref()
-            .and_then(|active| active.media.try_frame());
-        if let Some(decoded_frame) = decoded_frame {
-            if let Err(error) = self.upload_stream_frame(frame, &decoded_frame) {
-                self.status = error;
-            } else if let Some(active) = &mut self.active_stream {
-                active.media.record_presented(&decoded_frame);
-            }
-        }
+        self.present_media_frame(context, frame);
         if let Some(active) = &mut self.active_stream {
             active.media.report_stream_stats(&active.session);
             if let Some(error) = active.media.poll_error() {
@@ -672,16 +1135,66 @@ impl ArtemisApp {
         }
     }
 
+    fn present_media_frame(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+        let decoded_frame = self
+            .active_stream
+            .as_ref()
+            .and_then(|active| active.media.try_frame());
+        if let Some(decoded_frame) = decoded_frame {
+            if let Err(error) = self.upload_stream_frame(frame, &decoded_frame) {
+                self.status = error;
+            } else if let Some(active) = &mut self.active_stream {
+                active.media.record_presented(&decoded_frame);
+            }
+        }
+        context.request_repaint();
+    }
+
+    fn handle_autostop(&mut self, context: &egui::Context) -> bool {
+        if self
+            .autostop_deadline
+            .is_none_or(|deadline| Instant::now() < deadline)
+        {
+            return false;
+        }
+        let cancel_host = self.autostop_action.cancel_host();
+        tracing::info!(
+            cancel_host,
+            "diagnostic autostop deadline reached; disconnecting cleanly"
+        );
+        self.autostop_deadline = None;
+        self.autostop_action = AutostopAction::Disconnect;
+        self.cancel_completion = if cancel_host {
+            CancelCompletion::CloseApplication
+        } else {
+            CancelCompletion::RemainOpen
+        };
+        self.disconnect(context, cancel_host);
+        if !cancel_host {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        true
+    }
+
     fn upload_stream_frame(
         &mut self,
         frame: &mut eframe::Frame,
         decoded: &DecodedFrame,
     ) -> Result<(), String> {
         if let Some(texture) = &mut self.texture {
-            return texture.upload(decoded);
+            texture.upload(decoded, self.fullscreen)?;
+        } else {
+            self.texture = Some(StreamTexture::new(frame, decoded, self.fullscreen)?);
         }
-
-        self.texture = Some(StreamTexture::new(frame, decoded)?);
+        let native_hdr = self
+            .texture
+            .as_ref()
+            .is_some_and(StreamTexture::native_hdr_active);
+        if let Some(active) = &self.active_stream {
+            active
+                .media
+                .set_hdr_presentation(decoded.color.hdr_active, native_hdr);
+        }
         Ok(())
     }
 
@@ -693,7 +1206,7 @@ impl ArtemisApp {
             self.set_fullscreen(context, !self.fullscreen);
         }
         if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F10)) {
-            self.diagnostics_overlay.toggle();
+            self.toggle_diagnostics_preference();
         }
         if self.fullscreen
             && context
@@ -710,6 +1223,14 @@ impl ArtemisApp {
         context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
     }
 
+    fn toggle_diagnostics_preference(&mut self) {
+        self.diagnostics_overlay.toggle();
+        self.settings.show_performance_diagnostics = self.diagnostics_overlay.is_visible();
+        if let Err(error) = self.settings.save(self.identity.config_dir()) {
+            tracing::warn!(%error, "could not save diagnostics preference");
+        }
+    }
+
     fn disconnect(&mut self, context: &egui::Context, cancel_host: bool) {
         let Some(mut active) = self.active_stream.take() else {
             return;
@@ -718,8 +1239,10 @@ impl ArtemisApp {
         active.controller.disconnect(&mut active.session);
         active.media.shutdown();
         active.session.stop();
+        self.texture = None;
         self.autostop_deadline = None;
         self.autostop_after_connect = None;
+        self.autostop_action = AutostopAction::Disconnect;
         self.set_fullscreen(context, false);
         context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
         context.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
@@ -742,217 +1265,6 @@ impl ArtemisApp {
                 let _ = sender.send(TaskMessage::Cancelled(result));
             });
         }
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn browser_ui(&mut self, context: &egui::Context) {
-        egui::SidePanel::left("hosts")
-            .resizable(false)
-            .default_width(280.0)
-            .show(context, |ui| {
-                ui.add_space(20.0);
-                ui.heading(RichText::new("Hosts").size(24.0));
-                ui.add_space(12.0);
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Discover again"))
-                    .clicked()
-                {
-                    self.start_discovery();
-                }
-                ui.add_space(18.0);
-                section_label(ui, "PAIRED");
-                let paired = self.paired_hosts.clone();
-                for host in paired {
-                    if ui
-                        .selectable_label(
-                            self.selected_address.as_ref() == Some(&host.address),
-                            &host.name,
-                        )
-                        .clicked()
-                    {
-                        self.inspect(host.address);
-                    }
-                }
-                ui.add_space(18.0);
-                section_label(ui, "LOCAL NETWORK");
-                let discovered = self.discovered_hosts.clone();
-                for host in discovered {
-                    let label = format!("{}\n{}", host.name, host.address.host);
-                    if ui
-                        .selectable_label(
-                            self.selected_address.as_ref() == Some(&host.address),
-                            label,
-                        )
-                        .clicked()
-                    {
-                        self.inspect(host.address);
-                    }
-                }
-                ui.add_space(22.0);
-                section_label(ui, "MANUAL");
-                ui.text_edit_singleline(&mut self.manual_host);
-                ui.label(
-                    RichText::new("Host or host:port")
-                        .small()
-                        .color(Color32::from_rgb(120, 119, 116)),
-                );
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Connect"))
-                    .clicked()
-                {
-                    match parse_manual_host(&self.manual_host) {
-                        Ok(address) => self.inspect(address),
-                        Err(error) => self.status = error,
-                    }
-                }
-            });
-
-        egui::CentralPanel::default().show(context, |ui| {
-            ui.add_space(28.0);
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("Artemis Linux").size(30.0));
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(format!(
-                        "H.264 · {} · {} Mbps · SDR",
-                        self.stream_preset.label(),
-                        self.stream_bitrate.mbps()
-                    ))
-                    .small()
-                    .color(Color32::from_rgb(52, 101, 56)),
-                );
-            });
-            ui.add_space(28.0);
-            let Some(info) = self.selected_info.clone() else {
-                ui.label(
-                    RichText::new("Choose a discovered host or enter one manually.")
-                        .size(18.0)
-                        .color(Color32::from_rgb(120, 119, 116)),
-                );
-                return;
-            };
-            ui.group(|ui| {
-                ui.set_min_width(ui.available_width());
-                ui.heading(RichText::new(&info.name).size(24.0));
-                ui.label(format!("{} · GameStream {}", info.state, info.app_version));
-                ui.label(format!(
-                    "Codec capability 0x{:x} · HTTPS {}",
-                    info.codec_mode_support, info.https_port
-                ));
-                ui.add_space(12.0);
-                if self.selected_record.is_none() {
-                    ui.label("This client is not paired with the host.");
-                    ui.horizontal(|ui| {
-                        ui.label("Apollo passphrase (optional)");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.passphrase)
-                                .password(true)
-                                .desired_width(180.0),
-                        );
-                    });
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Start pairing"))
-                        .clicked()
-                    {
-                        self.start_pairing();
-                    }
-                    if let Some(pin) = &self.pairing_pin {
-                        ui.add_space(10.0);
-                        ui.label(RichText::new(format!("PIN  {pin}")).size(28.0).strong());
-                        ui.label("Enter this PIN in the host pairing dialog.");
-                    }
-                } else if ui
-                    .add_enabled(!self.busy, egui::Button::new("Refresh applications"))
-                    .clicked()
-                {
-                    self.refresh_applications();
-                }
-            });
-
-            if !self.applications.is_empty() {
-                ui.add_space(24.0);
-                section_label(ui, "STREAM QUALITY");
-                ui.add_space(8.0);
-                let previous_preset = self.stream_preset;
-                ui.horizontal(|ui| {
-                    for preset in StreamPreset::ALL {
-                        ui.selectable_value(&mut self.stream_preset, preset, preset.label());
-                    }
-                });
-                if self.stream_preset != previous_preset {
-                    self.stream_bitrate = self.stream_preset.default_bitrate();
-                }
-                let mut bitrate_mbps = self.stream_bitrate.mbps();
-                let bitrate_slider = egui::Slider::new(
-                    &mut bitrate_mbps,
-                    StreamBitrate::MIN_MBPS..=StreamBitrate::MAX_MBPS,
-                )
-                .step_by(5.0)
-                .suffix(" Mbps")
-                .text("Bitrate");
-                if ui.add(bitrate_slider).changed() {
-                    if let Some(bitrate) = StreamBitrate::from_mbps(bitrate_mbps) {
-                        self.stream_bitrate = bitrate;
-                    }
-                }
-                ui.label(
-                    RichText::new(format!(
-                        "H.264 SDR · {} Mbps default · 300 Mbps maximum",
-                        self.stream_preset.default_bitrate().mbps()
-                    ))
-                    .small()
-                    .color(Color32::from_rgb(120, 119, 116)),
-                );
-                let mut diagnostics_enabled = self.diagnostics_overlay.is_visible();
-                if ui
-                    .checkbox(
-                        &mut diagnostics_enabled,
-                        "Show performance diagnostics while streaming",
-                    )
-                    .on_hover_text("Toggle during a stream with F10")
-                    .changed()
-                {
-                    self.diagnostics_overlay = if diagnostics_enabled {
-                        DiagnosticsOverlay::Visible
-                    } else {
-                        DiagnosticsOverlay::Hidden
-                    };
-                }
-                ui.add_space(24.0);
-                section_label(ui, "APPLICATIONS");
-                ui.add_space(8.0);
-                let applications = self.applications.clone();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for application in applications {
-                        ui.group(|ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new(&application.title).size(18.0).strong());
-                                    ui.label(
-                                        RichText::new(format!("Application {}", application.id))
-                                            .small()
-                                            .color(Color32::from_rgb(120, 119, 116)),
-                                    );
-                                });
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add_enabled(!self.busy, egui::Button::new("Stream"))
-                                            .clicked()
-                                        {
-                                            self.launch(application.clone());
-                                        }
-                                    },
-                                );
-                            });
-                        });
-                        ui.add_space(8.0);
-                    }
-                });
-            }
-        });
     }
 
     fn stream_ui(&mut self, context: &egui::Context) {
@@ -983,13 +1295,13 @@ impl ArtemisApp {
                             .on_hover_text("Toggle performance diagnostics (F10)")
                             .clicked()
                         {
-                            self.diagnostics_overlay.toggle();
+                            self.toggle_diagnostics_preference();
                         }
                     });
                 });
             });
         }
-        egui::CentralPanel::default()
+        let stream_panel = egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::BLACK))
             .show(context, |ui| {
                 if let Some(texture) = &self.texture {
@@ -1000,7 +1312,12 @@ impl ArtemisApp {
                         .max(0.01);
                     let size = source * scale;
                     ui.centered_and_justified(|ui| {
-                        ui.image((texture.id(), size));
+                        let rect = egui::Rect::from_center_size(ui.max_rect().center(), size);
+                        if let Some(callback) = texture.hdr_paint_callback(rect) {
+                            ui.painter().add(callback);
+                        } else {
+                            ui.image((texture.id(), size));
+                        }
                     });
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -1011,6 +1328,15 @@ impl ArtemisApp {
         if self.diagnostics_overlay.is_visible() {
             self.performance_overlay(context);
         }
+        let pointer_over_stream = context.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|position| stream_panel.response.rect.contains(position))
+        });
+        if self.fullscreen || pointer_over_stream {
+            context.set_cursor_icon(egui::CursorIcon::None);
+        }
     }
 
     fn performance_overlay(&self, context: &egui::Context) {
@@ -1018,6 +1344,17 @@ impl ArtemisApp {
             return;
         };
         let diagnostics = active.media.diagnostics();
+        let text_color = if self
+            .texture
+            .as_ref()
+            .is_some_and(StreamTexture::native_hdr_active)
+        {
+            // PQ code value for roughly 200 nit reference white. The whole fullscreen surface is
+            // BT.2020/PQ while native HDR is active, so ordinary sRGB white would signal 10,000 nits.
+            Color32::from_gray(148)
+        } else {
+            Color32::WHITE
+        };
         let top_offset = if self.fullscreen { 12.0 } else { 56.0 };
         egui::Area::new(egui::Id::new("performance_diagnostics"))
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, top_offset))
@@ -1034,17 +1371,17 @@ impl ArtemisApp {
                             RichText::new("PERFORMANCE DIAGNOSTICS  ·  F10")
                                 .monospace()
                                 .strong()
-                                .color(Color32::WHITE),
+                                .color(text_color),
                         );
                         ui.label(
                             RichText::new(overlay_text(
                                 &active.profile_label,
                                 active.connection_quality,
-                                diagnostics,
+                                &diagnostics,
                             ))
                             .monospace()
                             .size(12.0)
-                            .color(Color32::WHITE),
+                            .color(text_color),
                         );
                     });
             });
@@ -1054,7 +1391,7 @@ impl ArtemisApp {
 fn overlay_text(
     profile_label: &str,
     connection_quality: ConnectionQuality,
-    diagnostics: StreamDiagnostics,
+    diagnostics: &StreamDiagnostics,
 ) -> String {
     let quality = match connection_quality {
         ConnectionQuality::Okay => "Good",
@@ -1066,18 +1403,43 @@ fn overlay_text(
     let audio_drift = diagnostics
         .audio_clock_drift_ms
         .map_or_else(|| "—".to_owned(), |value| format!("{value:+} ms"));
+    let hdr_source = if diagnostics.hdr_source_active {
+        "HDR10"
+    } else {
+        "SDR"
+    };
+    let hdr_metadata = diagnostics.hdr_max_content_light_level.map_or_else(
+        || {
+            if diagnostics.hdr_metadata_available {
+                "metadata present".to_owned()
+            } else {
+                "no metadata".to_owned()
+            }
+        },
+        |value| format!("MaxCLL {value} nits"),
+    );
     format!(
-        "\nStream    {profile_label} · Connection {quality}\n\
-         Decoder   {} · {}\n\
-         Video     In {:>5.1} · Decode {:>5.1} · Present {:>5.1} FPS\n\
+        "\nRequested {profile_label}\n\
+         Delivered Connection {quality}\n\
+         Decoder   {} · {} · {}\n\
+         Color     {hdr_source} · {} · {hdr_metadata}\n\
+         Output    {}\n\
+         Audio out {} · {}\n\
+         Video     In {:>5.1} · Decode {:>5.1} · Present {:>5.1} FPS delivered\n\
          Drops     Decode queue {} · Callback queue {} /s\n\
-         Network   {:>6.1} Mbps · {:>6.0} video packets/s\n\
+         Network   {:>6.1} Mbps delivered · {:>6.0} video packets/s\n\
          Issues    Video {} · recovered {} /s\n\
          Audio     {:>5.0} packets/s · {:>5.0} Kbps\n\
          Issues    Audio {} · recovered {} /s\n\
-         Clocks    Video {video_drift} · Audio {audio_drift}",
+         Clocks    Video {video_drift} · Audio {audio_drift}
+         Pacing    {}",
         diagnostics.decoder,
         diagnostics.memory_path,
+        diagnostics.video_bit_depth,
+        diagnostics.video_color_space,
+        diagnostics.hdr_presentation,
+        diagnostics.audio_layout,
+        diagnostics.audio_output,
         diagnostics.video_ingress_fps,
         diagnostics.decoded_fps,
         diagnostics.presented_fps,
@@ -1091,16 +1453,41 @@ fn overlay_text(
         diagnostics.audio_kbps,
         diagnostics.audio_packet_issues,
         diagnostics.audio_fec_recovered,
+        if diagnostics.frame_pacing_active {
+            "Presentation timestamps"
+        } else {
+            "Low-latency latest frame"
+        },
     )
 }
 
+fn trace_decoder_capabilities(capabilities: DecoderCapabilities) {
+    tracing::info!(
+        target: "artemis::media",
+        h264 = capabilities.h264.available,
+        h264_hardware = capabilities.h264.hardware,
+        hevc = capabilities.hevc.available,
+        hevc_hardware = capabilities.hevc.hardware,
+        hevc_main10 = capabilities.hevc.main10,
+        av1 = capabilities.av1.available,
+        av1_hardware = capabilities.av1.hardware,
+        av1_main10 = capabilities.av1.main10,
+        presentation_bit_depth = capabilities.presentation_bit_depth,
+        "video decoder capabilities"
+    );
+}
+
 impl eframe::App for ArtemisApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::from_rgb(28, 30, 37).to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
         self.drain_tasks(context);
         let suppress_escape = self.handle_stream_shortcuts(context);
         self.pump_stream(context, frame, suppress_escape);
 
-        if !self.fullscreen {
+        if self.active_stream.is_some() && !self.fullscreen {
             egui::TopBottomPanel::bottom("status")
                 .exact_height(30.0)
                 .show(context, |ui| {
@@ -1119,9 +1506,14 @@ impl eframe::App for ArtemisApp {
 
         if self.active_stream.is_some() {
             self.stream_ui(context);
+            // The compositor supplies the presentation cadence. Continuous frame callbacks avoid
+            // missing a vblank while the media runtime still holds early 30 FPS frames by PTS.
             context.request_repaint();
         } else {
             self.browser_ui(context);
+            if self.busy {
+                context.request_repaint_after(Duration::from_millis(50));
+            }
         }
     }
 }
@@ -1137,34 +1529,61 @@ impl Drop for ArtemisApp {
     }
 }
 
+fn application_for_apollo_launch(
+    applications: &[Application],
+    request: &ApolloLaunchRequest,
+) -> Option<Application> {
+    request
+        .app_uuid
+        .as_deref()
+        .and_then(|uuid| {
+            applications.iter().find(|application| {
+                application
+                    .uuid
+                    .as_deref()
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(uuid))
+            })
+        })
+        .or_else(|| {
+            request
+                .app_id
+                .and_then(|id| applications.iter().find(|application| application.id == id))
+        })
+        .or_else(|| {
+            request.app_name.as_deref().and_then(|name| {
+                applications
+                    .iter()
+                    .find(|application| application.title.eq_ignore_ascii_case(name))
+            })
+        })
+        .cloned()
+}
+
 fn configure_style(context: &egui::Context) {
-    let mut visuals = egui::Visuals::light();
-    visuals.panel_fill = Color32::from_rgb(247, 246, 243);
-    visuals.window_fill = Color32::from_rgb(251, 251, 250);
-    visuals.faint_bg_color = Color32::from_rgb(249, 249, 248);
-    visuals.extreme_bg_color = Color32::WHITE;
-    visuals.widgets.inactive.bg_stroke.color = Color32::from_rgb(234, 234, 234);
-    visuals.widgets.hovered.bg_stroke.color = Color32::from_rgb(180, 180, 178);
-    visuals.selection.bg_fill = Color32::from_rgb(225, 243, 254);
-    visuals.selection.stroke.color = Color32::from_rgb(31, 108, 159);
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = Color32::from_rgb(28, 30, 37);
+    visuals.window_fill = Color32::from_rgb(53, 70, 111);
+    visuals.faint_bg_color = Color32::from_rgb(42, 46, 57);
+    visuals.extreme_bg_color = Color32::from_rgb(22, 24, 30);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(63, 78, 116);
+    visuals.widgets.inactive.bg_stroke.color = Color32::from_rgb(92, 112, 159);
+    visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(224, 228, 239);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(77, 102, 158);
+    visuals.widgets.hovered.bg_stroke.color = Color32::from_rgb(126, 164, 230);
+    visuals.widgets.hovered.fg_stroke.color = Color32::WHITE;
+    visuals.widgets.active.bg_fill = Color32::from_rgb(67, 91, 149);
+    visuals.widgets.active.fg_stroke.color = Color32::WHITE;
+    visuals.selection.bg_fill = Color32::from_rgb(101, 151, 225);
+    visuals.selection.stroke.color = Color32::WHITE;
     context.set_visuals(visuals);
 
     let mut style = (*context.style()).clone();
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-    style.spacing.button_padding = egui::vec2(14.0, 7.0);
-    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(5);
-    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(5);
-    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(5);
+    style.spacing.button_padding = egui::vec2(16.0, 11.0);
+    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(7);
+    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(7);
+    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(7);
     context.set_style(style);
-}
-
-fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        RichText::new(text)
-            .size(11.0)
-            .strong()
-            .color(Color32::from_rgb(120, 119, 116)),
-    );
 }
 
 fn parse_manual_host(value: &str) -> std::result::Result<HostAddress, String> {
@@ -1187,24 +1606,42 @@ fn parse_manual_host(value: &str) -> std::result::Result<HostAddress, String> {
 }
 
 fn autostart_from_environment() -> std::result::Result<Option<AutostartRequest>, String> {
-    autostart_from_values(
-        std::env::var(AUTOSTART_HOST_ENV).ok().as_deref(),
-        std::env::var(AUTOSTART_APP_ENV).ok().as_deref(),
-        std::env::var(AUTOSTART_PRESET_ENV).ok().as_deref(),
-        std::env::var(AUTOSTART_BITRATE_ENV).ok().as_deref(),
-        std::env::var(AUTOSTART_FULLSCREEN_ENV).ok().as_deref(),
-        std::env::var(AUTOSTOP_AFTER_ENV).ok().as_deref(),
-    )
+    let host = std::env::var(AUTOSTART_HOST_ENV).ok();
+    let application = std::env::var(AUTOSTART_APP_ENV).ok();
+    let preset = std::env::var(AUTOSTART_PRESET_ENV).ok();
+    let frame_rate = std::env::var(AUTOSTART_FPS_ENV).ok();
+    let bitrate_mbps = std::env::var(AUTOSTART_BITRATE_ENV).ok();
+    let codec = std::env::var(AUTOSTART_CODEC_ENV).ok();
+    let fullscreen = std::env::var(AUTOSTART_FULLSCREEN_ENV).ok();
+    let autostop_after_seconds = std::env::var(AUTOSTOP_AFTER_ENV).ok();
+    let autostop_cancel_host = std::env::var(AUTOSTOP_CANCEL_HOST_ENV).ok();
+    autostart_from_values(AutostartValues {
+        host: host.as_deref(),
+        application: application.as_deref(),
+        preset: preset.as_deref(),
+        frame_rate: frame_rate.as_deref(),
+        bitrate_mbps: bitrate_mbps.as_deref(),
+        codec: codec.as_deref(),
+        fullscreen: fullscreen.as_deref(),
+        autostop_after_seconds: autostop_after_seconds.as_deref(),
+        autostop_cancel_host: autostop_cancel_host.as_deref(),
+    })
 }
 
 fn autostart_from_values(
-    host: Option<&str>,
-    application: Option<&str>,
-    preset: Option<&str>,
-    bitrate_mbps: Option<&str>,
-    fullscreen: Option<&str>,
-    autostop_after_seconds: Option<&str>,
+    values: AutostartValues<'_>,
 ) -> std::result::Result<Option<AutostartRequest>, String> {
+    let AutostartValues {
+        host,
+        application,
+        preset,
+        frame_rate,
+        bitrate_mbps,
+        codec,
+        fullscreen,
+        autostop_after_seconds,
+        autostop_cancel_host,
+    } = values;
     let (Some(host), Some(application)) = (host, application) else {
         if host.is_some() || application.is_some() {
             return Err(format!(
@@ -1218,21 +1655,27 @@ fn autostart_from_values(
     if application_title.is_empty() {
         return Err(format!("{AUTOSTART_APP_ENV} cannot be empty"));
     }
-    let preset = parse_autostart_preset(preset.unwrap_or("1080p60"))?;
-    let bitrate = match bitrate_mbps {
+    let preset_value = preset.unwrap_or("1080p");
+    let preset = parse_autostart_preset(preset_value)?;
+    let frame_rate = match frame_rate {
+        Some(value) => parse_autostart_frame_rate(value)?,
+        None => parse_frame_rate_from_preset(preset_value),
+    };
+    let codec = parse_autostart_codec(codec.unwrap_or("auto"))?;
+    let bitrate_override = match bitrate_mbps {
         Some(value) => {
             let mbps = value
                 .parse::<i32>()
                 .map_err(|_| format!("{AUTOSTART_BITRATE_ENV} must be a whole number"))?;
-            StreamBitrate::from_mbps(mbps).ok_or_else(|| {
+            Some(StreamBitrate::from_mbps(mbps).ok_or_else(|| {
                 format!(
                     "{AUTOSTART_BITRATE_ENV} must be between {} and {}",
                     StreamBitrate::MIN_MBPS,
                     StreamBitrate::MAX_MBPS
                 )
-            })?
+            })?)
         }
-        None => preset.default_bitrate(),
+        None => None,
     };
     let fullscreen = match fullscreen.unwrap_or("false").to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" => true,
@@ -1256,23 +1699,86 @@ fn autostart_from_values(
             Ok(Duration::from_secs(seconds))
         })
         .transpose()?;
+    let autostop_cancel_host =
+        parse_optional_boolean(autostop_cancel_host, AUTOSTOP_CANCEL_HOST_ENV)?;
+    if autostop_cancel_host && autostop_after.is_none() {
+        return Err(format!(
+            "{AUTOSTOP_CANCEL_HOST_ENV} requires {AUTOSTOP_AFTER_ENV}"
+        ));
+    }
     Ok(Some(AutostartRequest {
         address,
         application_title: application_title.to_owned(),
         preset,
-        bitrate,
+        frame_rate,
+        bitrate_override,
+        codec,
         fullscreen,
         autostop_after,
+        autostop_cancel_host,
     }))
 }
 
-fn parse_autostart_preset(value: &str) -> std::result::Result<StreamPreset, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1080p60" => Ok(StreamPreset::FullHd60),
-        "1440p60" => Ok(StreamPreset::QuadHd60),
-        "4k60" | "2160p60" => Ok(StreamPreset::UltraHd60),
+fn parse_optional_boolean(
+    value: Option<&str>,
+    variable: &str,
+) -> std::result::Result<bool, String> {
+    match value.unwrap_or("false").to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(format!("{variable} must be true, false, 1, 0, yes, or no")),
+    }
+}
+
+fn parse_autostart_frame_rate(value: &str) -> std::result::Result<StreamFrameRate, String> {
+    match value
+        .trim()
+        .trim_end_matches(['f', 'p', 's', 'F', 'P', 'S'])
+    {
+        "30" => Ok(StreamFrameRate::Fps30),
+        "60" => Ok(StreamFrameRate::Fps60),
         _ => Err(format!(
-            "{AUTOSTART_PRESET_ENV} must be 1080p60, 1440p60, 4K60, or 2160p60"
+            "{AUTOSTART_FPS_ENV} must be 30 or 60; higher refresh rates are not enabled yet"
+        )),
+    }
+}
+
+fn parse_frame_rate_from_preset(value: &str) -> StreamFrameRate {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.ends_with("30") {
+        StreamFrameRate::Fps30
+    } else {
+        StreamFrameRate::Fps60
+    }
+}
+
+fn parse_autostart_codec(value: &str) -> std::result::Result<VideoCodecPreference, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "automatic" => Ok(VideoCodecPreference::Automatic),
+        "av1" => Ok(VideoCodecPreference::Av1),
+        "hevc" | "h265" | "h.265" => Ok(VideoCodecPreference::Hevc),
+        "h264" | "h.264" => Ok(VideoCodecPreference::H264),
+        _ => Err(format!(
+            "{AUTOSTART_CODEC_ENV} must be auto, AV1, HEVC, H265, or H264"
+        )),
+    }
+}
+
+fn parse_autostart_preset(value: &str) -> std::result::Result<StreamPreset, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.ends_with("90") || normalized.ends_with("120") {
+        return Err(format!(
+            "{AUTOSTART_PRESET_ENV} supports only 30 or 60 FPS; higher refresh rates are not \
+             enabled yet"
+        ));
+    }
+    match normalized.as_str() {
+        "720p" | "720p30" | "720p60" => Ok(StreamPreset::Hd60),
+        "1080p" | "1080p30" | "1080p60" => Ok(StreamPreset::FullHd60),
+        "1440p" | "1440p30" | "1440p60" => Ok(StreamPreset::QuadHd60),
+        "4k" | "4k30" | "4k60" | "2160p" | "2160p30" | "2160p60" => Ok(StreamPreset::UltraHd60),
+        _ => Err(format!(
+            "{AUTOSTART_PRESET_ENV} must be 720p, 1080p, 1440p, 4K, or 2160p"
         )),
     }
 }
@@ -1281,11 +1787,20 @@ fn parse_autostart_preset(value: &str) -> std::result::Result<StreamPreset, Stri
 mod tests {
     use std::time::Duration;
 
-    use artemis_core::StreamPreset;
-    use artemis_moonlight::ConnectionQuality;
+    use artemis_core::{Application, StreamFrameRate, StreamPreset};
+    use artemis_moonlight::{
+        ConnectionQuality, VIDEO_FORMAT_AV1, VIDEO_FORMAT_AV1_MAIN10, VIDEO_FORMAT_H264,
+        VIDEO_FORMAT_HEVC, VIDEO_FORMAT_HEVC_MAIN10,
+    };
 
-    use super::{AUTOSTART_APP_ENV, autostart_from_values, overlay_text, parse_manual_host};
-    use crate::media::StreamDiagnostics;
+    use super::{
+        AUTOSTART_APP_ENV, AUTOSTOP_AFTER_ENV, AutostartValues, VideoBitDepthPreference,
+        VideoCodecPreference, application_for_apollo_launch, apply_autostart_settings,
+        autostart_from_values, overlay_text, parse_manual_host,
+    };
+    use crate::deep_link::ApolloLaunchRequest;
+    use crate::media::{DecoderCapabilities, DecoderSupport, StreamDiagnostics};
+    use crate::settings::{AppSettings, BitrateMode};
 
     #[test]
     fn parses_default_and_explicit_ports() {
@@ -1303,38 +1818,256 @@ mod tests {
 
     #[test]
     fn parses_diagnostic_autostart_profile() {
-        let request = autostart_from_values(
-            Some("192.168.100.128"),
-            Some("Desktop"),
-            Some("4K60"),
-            Some("40"),
-            Some("true"),
-            Some("30"),
-        )
+        let request = autostart_from_values(AutostartValues {
+            host: Some("192.168.100.128"),
+            application: Some("Desktop"),
+            preset: Some("4K"),
+            frame_rate: Some("60"),
+            bitrate_mbps: Some("40"),
+            codec: Some("av1"),
+            fullscreen: Some("true"),
+            autostop_after_seconds: Some("30"),
+            autostop_cancel_host: Some("true"),
+        })
         .expect("valid configuration")
         .expect("autostart request");
 
         assert_eq!(request.address.host, "192.168.100.128");
         assert_eq!(request.application_title, "Desktop");
         assert_eq!(request.preset, StreamPreset::UltraHd60);
-        assert_eq!(request.bitrate.mbps(), 40);
+        assert_eq!(request.frame_rate, StreamFrameRate::Fps60);
+        assert_eq!(
+            request.bitrate_override.expect("explicit bitrate").mbps(),
+            40
+        );
+        assert_eq!(request.codec, VideoCodecPreference::Av1);
         assert!(request.fullscreen);
         assert_eq!(request.autostop_after, Some(Duration::from_secs(30)));
+        assert!(request.autostop_cancel_host);
+    }
+
+    #[test]
+    fn parses_seven_twenty_p_sixty_with_a_codec_recommendation() {
+        let request = autostart_from_values(AutostartValues {
+            host: Some("192.168.100.128"),
+            application: Some("Desktop"),
+            preset: Some("720p60"),
+            codec: Some("auto"),
+            ..AutostartValues::default()
+        })
+        .expect("valid configuration")
+        .expect("autostart request");
+
+        assert_eq!(request.preset, StreamPreset::Hd60);
+        assert_eq!(request.frame_rate, StreamFrameRate::Fps60);
+        assert!(request.bitrate_override.is_none());
+
+        let mut settings = AppSettings::default();
+        apply_autostart_settings(
+            &mut settings,
+            Some(&request),
+            DecoderCapabilities {
+                h264: DecoderSupport {
+                    available: true,
+                    hardware: true,
+                    main10: false,
+                },
+                hevc: DecoderSupport {
+                    available: true,
+                    hardware: true,
+                    main10: true,
+                },
+                av1: DecoderSupport {
+                    available: true,
+                    hardware: false,
+                    main10: false,
+                },
+                presentation_bit_depth: 10,
+            },
+        );
+        assert_eq!(settings.bitrate_mode, BitrateMode::Balanced);
+        assert_eq!(settings.bitrate_mbps, 4);
+    }
+
+    #[test]
+    fn rejects_high_refresh_autostart_profiles_for_now() {
+        let error = autostart_from_values(AutostartValues {
+            host: Some("192.168.100.128"),
+            application: Some("Desktop"),
+            preset: Some("720p90"),
+            codec: Some("auto"),
+            ..AutostartValues::default()
+        })
+        .expect_err("90 FPS should not be enabled");
+
+        assert!(error.contains("30 or 60"));
+
+        let error = autostart_from_values(AutostartValues {
+            host: Some("192.168.100.128"),
+            application: Some("Desktop"),
+            frame_rate: Some("120"),
+            ..AutostartValues::default()
+        })
+        .expect_err("120 FPS should not be enabled");
+
+        assert!(error.contains("30 or 60"));
+    }
+
+    #[test]
+    fn host_cancellation_requires_an_autostop_deadline() {
+        let error = autostart_from_values(AutostartValues {
+            host: Some("192.168.100.128"),
+            application: Some("Desktop"),
+            autostop_cancel_host: Some("true"),
+            ..AutostartValues::default()
+        })
+        .expect_err("cancellation without a deadline");
+
+        assert!(error.contains(AUTOSTOP_AFTER_ENV));
     }
 
     #[test]
     fn requires_both_autostart_target_values() {
-        let error = autostart_from_values(
-            Some("192.168.100.128"),
-            None,
-            Some("4K60"),
-            None,
-            None,
-            None,
-        )
+        let error = autostart_from_values(AutostartValues {
+            host: Some("192.168.100.128"),
+            preset: Some("4K60"),
+            ..AutostartValues::default()
+        })
         .expect_err("incomplete configuration");
 
         assert!(error.contains(AUTOSTART_APP_ENV));
+    }
+
+    #[test]
+    fn automatic_codec_mode_advertises_only_hardware_advanced_codecs() {
+        let capabilities = DecoderCapabilities {
+            h264: DecoderSupport {
+                available: true,
+                hardware: false,
+                main10: false,
+            },
+            hevc: DecoderSupport {
+                available: true,
+                hardware: true,
+                main10: true,
+            },
+            av1: DecoderSupport {
+                available: true,
+                hardware: true,
+                main10: true,
+            },
+            presentation_bit_depth: 10,
+        };
+
+        assert_eq!(
+            VideoCodecPreference::Automatic
+                .supported_video_formats(VideoBitDepthPreference::EightBit, capabilities),
+            VIDEO_FORMAT_AV1 | VIDEO_FORMAT_HEVC | VIDEO_FORMAT_H264
+        );
+    }
+
+    #[test]
+    fn automatic_bitrate_recommendation_uses_the_best_hardware_decoder() {
+        let capabilities = DecoderCapabilities {
+            h264: DecoderSupport {
+                available: true,
+                hardware: false,
+                main10: false,
+            },
+            hevc: DecoderSupport {
+                available: true,
+                hardware: true,
+                main10: true,
+            },
+            av1: DecoderSupport {
+                available: true,
+                hardware: false,
+                main10: false,
+            },
+            presentation_bit_depth: 10,
+        };
+
+        assert_eq!(
+            VideoCodecPreference::Automatic.bitrate_preference(capabilities),
+            VideoCodecPreference::Hevc
+        );
+    }
+
+    #[test]
+    fn hevc_preference_excludes_av1_and_retains_h264_fallback() {
+        let available = DecoderSupport {
+            available: true,
+            hardware: true,
+            main10: true,
+        };
+        let capabilities = DecoderCapabilities {
+            h264: available,
+            hevc: available,
+            av1: available,
+            presentation_bit_depth: 10,
+        };
+
+        assert_eq!(
+            VideoCodecPreference::Hevc
+                .supported_video_formats(VideoBitDepthPreference::EightBit, capabilities),
+            VIDEO_FORMAT_HEVC | VIDEO_FORMAT_H264
+        );
+    }
+
+    #[test]
+    fn main10_advertising_requires_decoder_and_ten_bit_presentation() {
+        let support = DecoderSupport {
+            available: true,
+            hardware: true,
+            main10: true,
+        };
+        let mut capabilities = DecoderCapabilities {
+            h264: DecoderSupport::default(),
+            hevc: support,
+            av1: support,
+            presentation_bit_depth: 8,
+        };
+
+        assert_eq!(
+            VideoCodecPreference::Automatic
+                .supported_video_formats(VideoBitDepthPreference::TenBit, capabilities),
+            0
+        );
+        capabilities.presentation_bit_depth = 10;
+        assert_eq!(
+            VideoCodecPreference::Automatic
+                .supported_video_formats(VideoBitDepthPreference::TenBit, capabilities),
+            VIDEO_FORMAT_AV1_MAIN10 | VIDEO_FORMAT_HEVC_MAIN10
+        );
+    }
+
+    #[test]
+    fn apollo_launch_prefers_the_stable_application_uuid() {
+        let applications = [
+            Application {
+                id: 1,
+                uuid: Some("desktop-uuid".to_owned()),
+                title: "Desktop".to_owned(),
+                hdr_supported: false,
+            },
+            Application {
+                id: 2,
+                uuid: Some("steam-uuid".to_owned()),
+                title: "Steam".to_owned(),
+                hdr_supported: false,
+            },
+        ];
+        let request = ApolloLaunchRequest {
+            host_uuid: "host".to_owned(),
+            host_name: None,
+            app_uuid: Some("STEAM-UUID".to_owned()),
+            app_name: Some("Renamed Steam".to_owned()),
+            app_id: Some(99),
+        };
+
+        let application =
+            application_for_apollo_launch(&applications, &request).expect("matched application");
+        assert_eq!(application.id, 2);
     }
 
     #[test]
@@ -1342,7 +2075,7 @@ mod tests {
         let text = overlay_text(
             "3840x2160 at 60 FPS · 100 Mbps",
             ConnectionQuality::Okay,
-            StreamDiagnostics {
+            &StreamDiagnostics {
                 video_ingress_fps: 60.0,
                 decoded_fps: 59.8,
                 presented_fps: 58.9,
@@ -1354,10 +2087,11 @@ mod tests {
             },
         );
 
-        assert!(text.contains("3840x2160 at 60 FPS · 100 Mbps"));
+        assert!(text.contains("Requested 3840x2160 at 60 FPS · 100 Mbps"));
+        assert!(text.contains("Delivered Connection Good"));
         assert!(text.contains("VA-API H.264 (vah264dec)"));
-        assert!(text.contains("Present  58.9 FPS"));
-        assert!(text.contains("96.4 Mbps"));
+        assert!(text.contains("Present  58.9 FPS delivered"));
+        assert!(text.contains("96.4 Mbps delivered"));
         assert!(text.contains("200 packets/s"));
     }
 }
