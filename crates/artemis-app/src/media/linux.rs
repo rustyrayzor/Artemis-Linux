@@ -2570,7 +2570,9 @@ mod tests {
         assert!(!description.contains("format=RGBA"));
         assert!(description.contains("colorimetry=bt2100-pq"));
         assert!(description.contains("sync=true qos=true max-lateness=20000000"));
-        gst::parse::launch(&description).expect("construct the Main10 HEVC pipeline");
+        if gst::ElementFactory::find(VA_HEVC_DECODER.element).is_some() {
+            gst::parse::launch(&description).expect("construct the Main10 HEVC pipeline");
+        }
     }
 
     #[test]
